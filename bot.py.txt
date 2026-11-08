@@ -1,0 +1,4064 @@
+"""
+🔮 KAGE DUB — ANIME TELEGRAM BOT (bitta fayl)
+=============================================
+aiogram 3.31 · SQLAlchemy async · PostgreSQL (yoki SQLite) · Render (webhook)
+
+requirements.txt (shu 6 qatorni alohida faylga yozing):
+    aiogram==3.31.0
+    aiohttp==3.14.5
+    aiosqlite==0.22.1
+    asyncpg==0.32.0
+    python-dotenv==1.2.2
+    SQLAlchemy[asyncio]==2.1.6
+
+Muhit o'zgaruvchilari (Render → Environment yoki lokal .env fayl):
+    BOT_TOKEN            @BotFather tokeni                      (MAJBURIY)
+    OWNER_ID             8318241400                              (MAJBURIY)
+    DATABASE_URL         Render PostgreSQL "Internal Database URL" (bo'sh bo'lsa SQLite)
+    DEFAULT_SUB_CHANNEL  @kagedub1  (birinchi majburiy kanal; bot u yerda ADMIN bo'lishi shart)
+    ADMIN_IDS            ixtiyoriy, vergul bilan
+    BOT_NAME / BOT_USERNAME / TIMEZONE   ixtiyoriy (Kage Dub / Kage_Dub_bot / Asia/Tashkent)
+    BASE_URL             bo'sh qoldiring: Render RENDER_EXTERNAL_URL ni o'zi beradi -> webhook rejimi
+    PYTHON_VERSION       3.12.3  (faqat Render'da)
+
+Render: Build `pip install -r requirements.txt` | Start `python main.py` | Health Check Path `/health`
+Monitor (UptimeRobot) har 5 daqiqada https://SIZNING-NOM.onrender.com/health ni tekshirsin.
+Lokal sinov: BASE_URL bo'sh bo'lsa polling rejimida ishlaydi.
+
+Fayl tuzilishi (yuqoridan pastga, tartibni o'zgartirmang):
+    matnlar → sozlamalar → baza → yordamchilar → tugmalar → xizmatlar → middleware
+    → handlerlar → ishga tushirish
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import html
+import json
+import logging
+import os
+import re
+import time
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup, TelegramObject
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+from functools import lru_cache
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, delete, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from types import SimpleNamespace
+from typing import Any, Awaitable, Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
+
+logger = logging.getLogger("kage_dub")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MATNLAR (uz / ru)
+# ════════════════════════════════════════════════════════════════════════════
+
+PANEL_BTN = "🛠 Admin panel"
+
+TEXTS: dict[str, dict[str, str]] = {
+    "uz": {
+        "choose_lang": "🌐 <b>Tilni tanlang</b>\nВыберите язык",
+        "lang_set": "✅ Til o'zgartirildi",
+        "welcome": (
+            "🔮 <b>{bot}</b> botiga xush kelibsiz, <b>{name}</b>! 💜\n\n"
+            "Bu yerda eng sara animelarni o'zbek tilida tomosha qilishingiz mumkin 🎬\n\n"
+            "Pastdagi menyudan kerakli bo'limni tanlang 👇"
+        ),
+        "menu_hint": "Bo'limni tanlang yoki anime nomini yozing",
+        "sub_required": (
+            "🔒 <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:</b>\n\n"
+            "Obuna bo'lgach, «✅ Tekshirish» tugmasini bosing 👇"
+        ),
+        "sub_check_btn": "✅ Tekshirish",
+        "sub_not_yet": "❌ Siz hali barcha kanallarga obuna bo'lmadingiz!",
+        "btn_animes": "🎬 Animelar",
+        "btn_search": "🔍 Qidiruv",
+        "btn_genres": "🎭 Janrlar",
+        "btn_fav": "⭐ Sevimlilar",
+        "btn_vip": "💎 VIP",
+        "btn_lang": "🌐 Til",
+        "list_title": "🎬 <b>Barcha animelar</b> — {total} ta\n\nKerakli animeni tanlang 👇",
+        "list_empty": "😔 Hozircha animelar yo'q. Tez orada qo'shiladi!",
+        "search_prompt": (
+            "🔍 Anime <b>nomi</b>, <b>kodi</b> yoki <b>janrini</b> yuboring:\n\n"
+            "Masalan: <code>Naruto</code>, <code>12</code> yoki <code>Action</code>"
+        ),
+        "search_none": "😕 Hech narsa topilmadi. Boshqa nom yoki kod bilan urinib ko'ring.",
+        "search_found": "🔎 <b>Topilgan natijalar:</b>",
+        "genres_title": "🎭 <b>Janrni tanlang:</b>",
+        "genres_empty": "😔 Janrlar hali qo'shilmagan.",
+        "genre_list_title": "🎭 <b>{genre}</b> — {total} ta anime",
+        "genre_list_empty": "😔 Bu janrda hozircha anime yo'q.",
+        "fav_title": "⭐ <b>Sevimli animelaringiz</b> — {total} ta",
+        "fav_empty": "⭐ Sevimlilar ro'yxati hozircha bo'sh.\nAnime sahifasidagi ⭐ tugmasi orqali qo'shing.",
+        "fav_add": "⭐ Sevimlilarga qo'shish",
+        "fav_remove": "💔 Sevimlilardan olib tashlash",
+        "fav_added": "⭐ Sevimlilarga qo'shildi!",
+        "fav_removed": "💔 Sevimlilardan olib tashlandi.",
+        "back": "⬅️ Orqaga",
+        "card": (
+            "🎬 <b>{title}</b>{vip}\n\n"
+            "🎭 Janr: {genres}\n"
+            "📅 Yil: {year}\n"
+            "🆔 Kod: <code>{code}</code>\n"
+            "📼 Qismlar: {eps}\n"
+            "👁 Ko'rishlar: {views}\n\n"
+            "📝 {desc}"
+        ),
+        "card_pick": "\n\n👇 <b>Qismni tanlang:</b>",
+        "card_no_eps": "\n\n📼 Qismlar hali yuklanmagan.",
+        "ep_caption": "🎬 <b>{title}</b>\n📼 <b>{num}-qism</b>\n\n💜 {bot}",
+        "ep_missing": "❌ Qism topilmadi.",
+        "ep_send_failed": "⚠️ Qismni yuborib bo'lmadi. Keyinroq urinib ko'ring.",
+        "ep_all": "📚 Qismlar",
+        "anime_missing": "❌ Anime topilmadi yoki o'chirilgan.",
+        "vip_only_alert": "💎 Bu anime faqat VIP foydalanuvchilar uchun!",
+        "vip_only_text": "💎 <b>Bu anime faqat VIP uchun</b>\n\nVIP olish uchun pastdagi tugmani bosing 👇",
+        "btn_buy_vip": "💎 VIP olish",
+        "vip_info": (
+            "💎 <b>VIP imkoniyatlari</b>\n\n"
+            "✨ VIP belgisi bor animelarni ko'rish\n"
+            "🚀 Yangi animelarga birinchi bo'lib kirish\n\n"
+            "{status}\n\n"
+            "💰 <b>Tariflar:</b>\n{plans}\n\n"
+            "Tarifni tanlang 👇"
+        ),
+        "vip_active": "✅ VIP faol: <b>{until}</b> gacha",
+        "vip_none": "❌ Hozir sizda VIP yo'q",
+        "vip_pay": (
+            "💳 <b>To'lov</b>\n\n"
+            "📦 Tarif: <b>{plan}</b>\n"
+            "💰 Summa: <b>{amount} so'm</b>\n\n"
+            "💳 Karta: <code>{card}</code>\n"
+            "👤 Karta egasi: <b>{holder}</b>\n\n"
+            "To'lovni amalga oshirib, <b>chek (screenshot)</b> rasmini shu yerga yuboring 📸"
+        ),
+        "vip_no_card": "⚠️ To'lov usuli hali sozlanmagan. Iltimos, keyinroq urinib ko'ring.",
+        "vip_receipt_only": "📸 Iltimos, chekni <b>rasm</b> ko'rinishida yuboring.",
+        "vip_receipt_sent": "✅ Chek qabul qilindi! Tekshirilgach, VIP faollashadi ⏳",
+        "vip_approved": "🎉 <b>Tabriklaymiz!</b> VIP faollashtirildi 💎\n⏳ Amal qilish muddati: <b>{until}</b>",
+        "vip_rejected": "❌ To'lovingiz tasdiqlanmadi. Muammo bo'lsa, administratorga murojaat qiling.",
+        "btn_cancel": "❌ Bekor qilish",
+        "cancelled": "❌ Bekor qilindi.",
+        "error": "⚠️ Xatolik yuz berdi. Iltimos, birozdan so'ng qayta urinib ko'ring.",
+        "ep_prev": "⏮ Oldingi",
+        "ep_next": "Keyingi ⏭",
+        "watch_btn": "▶️ Tomosha qilish",
+    },
+    "ru": {
+        "choose_lang": "🌐 <b>Tilni tanlang</b>\nВыберите язык",
+        "lang_set": "✅ Язык изменён",
+        "welcome": (
+            "🔮 Добро пожаловать в <b>{bot}</b>, <b>{name}</b>! 💜\n\n"
+            "Здесь вы можете смотреть лучшие аниме в озвучке 🎬\n\n"
+            "Выберите нужный раздел в меню ниже 👇"
+        ),
+        "menu_hint": "Выберите раздел или напишите название аниме",
+        "sub_required": (
+            "🔒 <b>Чтобы пользоваться ботом, подпишитесь на каналы:</b>\n\n"
+            "После подписки нажмите «✅ Проверить» 👇"
+        ),
+        "sub_check_btn": "✅ Проверить",
+        "sub_not_yet": "❌ Вы ещё не подписались на все каналы!",
+        "btn_animes": "🎬 Аниме",
+        "btn_search": "🔍 Поиск",
+        "btn_genres": "🎭 Жанры",
+        "btn_fav": "⭐ Избранное",
+        "btn_vip": "💎 VIP",
+        "btn_lang": "🌐 Язык",
+        "list_title": "🎬 <b>Все аниме</b> — {total} шт.\n\nВыберите аниме 👇",
+        "list_empty": "😔 Пока аниме нет. Скоро добавим!",
+        "search_prompt": (
+            "🔍 Отправьте <b>название</b>, <b>код</b> или <b>жанр</b> аниме:\n\n"
+            "Например: <code>Naruto</code>, <code>12</code> или <code>Action</code>"
+        ),
+        "search_none": "😕 Ничего не найдено. Попробуйте другое название или код.",
+        "search_found": "🔎 <b>Результаты поиска:</b>",
+        "genres_title": "🎭 <b>Выберите жанр:</b>",
+        "genres_empty": "😔 Жанры пока не добавлены.",
+        "genre_list_title": "🎭 <b>{genre}</b> — {total} шт.",
+        "genre_list_empty": "😔 В этом жанре пока нет аниме.",
+        "fav_title": "⭐ <b>Ваше избранное</b> — {total} шт.",
+        "fav_empty": "⭐ Список избранного пока пуст.\nДобавляйте кнопкой ⭐ на странице аниме.",
+        "fav_add": "⭐ В избранное",
+        "fav_remove": "💔 Убрать из избранного",
+        "fav_added": "⭐ Добавлено в избранное!",
+        "fav_removed": "💔 Удалено из избранного.",
+        "back": "⬅️ Назад",
+        "card": (
+            "🎬 <b>{title}</b>{vip}\n\n"
+            "🎭 Жанр: {genres}\n"
+            "📅 Год: {year}\n"
+            "🆔 Код: <code>{code}</code>\n"
+            "📼 Серии: {eps}\n"
+            "👁 Просмотры: {views}\n\n"
+            "📝 {desc}"
+        ),
+        "card_pick": "\n\n👇 <b>Выберите серию:</b>",
+        "card_no_eps": "\n\n📼 Серии ещё не загружены.",
+        "ep_caption": "🎬 <b>{title}</b>\n📼 <b>{num}-серия</b>\n\n💜 {bot}",
+        "ep_missing": "❌ Серия не найдена.",
+        "ep_send_failed": "⚠️ Не удалось отправить серию. Попробуйте позже.",
+        "ep_all": "📚 Серии",
+        "anime_missing": "❌ Аниме не найдено или удалено.",
+        "vip_only_alert": "💎 Это аниме только для VIP-пользователей!",
+        "vip_only_text": "💎 <b>Это аниме только для VIP</b>\n\nНажмите кнопку ниже, чтобы получить VIP 👇",
+        "btn_buy_vip": "💎 Получить VIP",
+        "vip_info": (
+            "💎 <b>Возможности VIP</b>\n\n"
+            "✨ Доступ к аниме с отметкой VIP\n"
+            "🚀 Первыми получайте новые аниме\n\n"
+            "{status}\n\n"
+            "💰 <b>Тарифы:</b>\n{plans}\n\n"
+            "Выберите тариф 👇"
+        ),
+        "vip_active": "✅ VIP активен до: <b>{until}</b>",
+        "vip_none": "❌ У вас сейчас нет VIP",
+        "vip_pay": (
+            "💳 <b>Оплата</b>\n\n"
+            "📦 Тариф: <b>{plan}</b>\n"
+            "💰 Сумма: <b>{amount} сум</b>\n\n"
+            "💳 Карта: <code>{card}</code>\n"
+            "👤 Владелец карты: <b>{holder}</b>\n\n"
+            "После оплаты отправьте сюда <b>чек (скриншот)</b> 📸"
+        ),
+        "vip_no_card": "⚠️ Способ оплаты ещё не настроен. Попробуйте позже.",
+        "vip_receipt_only": "📸 Пожалуйста, отправьте чек в виде <b>картинки</b>.",
+        "vip_receipt_sent": "✅ Чек получен! После проверки VIP будет активирован ⏳",
+        "vip_approved": "🎉 <b>Поздравляем!</b> VIP активирован 💎\n⏳ Действует до: <b>{until}</b>",
+        "vip_rejected": "❌ Ваш платёж не подтверждён. Если это ошибка, обратитесь к администратору.",
+        "btn_cancel": "❌ Отмена",
+        "cancelled": "❌ Отменено.",
+        "error": "⚠️ Произошла ошибка. Пожалуйста, попробуйте позже.",
+        "ep_prev": "⏮ Назад",
+        "ep_next": "Далее ⏭",
+        "watch_btn": "▶️ Смотреть",
+    },
+}
+
+# Ban xabari faqat o'zbek tilida (buyurtma bo'yicha), ID va username yozilmaydi.
+BAN_TEXT = (
+    "🚫 <b>Hurmatli foydalanuvchi!</b>\n\n"
+    "Qoidalarni buzganingiz sababli botdan vaqtincha chetlashtirildingiz 😔\n\n"
+    "⏳ Qolgan muddat: <b>{left}</b>\n"
+    "🕒 Tugash vaqti: <b>{until}</b>\n\n"
+    "Muddat tugagach bot yana to'liq ishlaydi. Sabr qiling va qoidalarga amal qiling 💜"
+)
+UNBAN_TEXT = "✅ <b>Xushxabar!</b> Ban olib tashlandi 🎉\nBotdan yana erkin foydalanishingiz mumkin 💜"
+
+
+def t(lang: str, key: str, **kwargs) -> str:
+    text = TEXTS.get(lang, TEXTS["uz"]).get(key) or TEXTS["uz"][key]
+    return text.format(**kwargs) if kwargs else text
+
+
+def variants(key: str) -> set[str]:
+    """Ikkala tildagi matnlar to'plami (menyu tugmalarini aniqlash uchun)."""
+    return {TEXTS[lang][key] for lang in TEXTS}
+
+
+# Menyu tugmalari matnlari: to'lov chekini kutayotgan holatda ham ishlashi uchun kerak
+MENU_TEXTS = (variants("btn_animes") | variants("btn_search") | variants("btn_genres")
+              | variants("btn_fav") | variants("btn_lang"))
+
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def spawn(coro) -> None:
+    """Fon vazifasini ishga tushiradi va xotirada ushlab turadi (aks holda Python uni o'chirib yuborishi mumkin)."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SOZLAMALAR
+# ════════════════════════════════════════════════════════════════════════════
+
+load_dotenv()
+
+
+def _int_set(raw: str) -> frozenset[int]:
+    """'1, 2;3' ko'rinishidagi matnni sonlar to'plamiga aylantiradi."""
+    result: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            result.add(int(part))
+    return frozenset(result)
+
+
+def normalize_db_url(url: str) -> str:
+    """Render/Heroku bergan URL ni SQLAlchemy (asyncpg) formatiga o'giradi."""
+    url = (url or "").strip()
+    if not url:
+        return "sqlite+aiosqlite:///anime_bot.db"
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+    if url.startswith("postgresql+asyncpg://"):
+        parts = urlsplit(url)
+        query = dict(parse_qsl(parts.query))
+        if "sslmode" in query:  # asyncpg 'sslmode' emas, 'ssl' ni tushunadi
+            query["ssl"] = query.pop("sslmode")
+        url = urlunsplit(parts._replace(query=urlencode(query)))
+    return url
+
+
+@dataclass(frozen=True)
+class Config:
+    bot_token: str
+    owner_id: int
+    admin_ids: frozenset[int]
+    database_url: str
+    bot_name: str
+    bot_username: str
+    default_sub_channel: str
+    base_url: str
+    webhook_secret: str
+    port: int
+    timezone: str
+
+
+@lru_cache(maxsize=1)
+def get_config() -> Config:
+    token = os.getenv("BOT_TOKEN", "").strip()
+    owner = os.getenv("OWNER_ID", "").strip()
+    if not token:
+        raise RuntimeError("BOT_TOKEN topilmadi. .env faylga yoki Render Environment ga yozing.")
+    if not owner.isdigit():
+        raise RuntimeError("OWNER_ID topilmadi yoki noto'g'ri (faqat raqam bo'lishi kerak).")
+
+    base_url = (os.getenv("BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+    secret = os.getenv("WEBHOOK_SECRET", "").strip() or hashlib.sha256(token.encode()).hexdigest()[:40]
+
+    return Config(
+        bot_token=token,
+        owner_id=int(owner),
+        admin_ids=_int_set(os.getenv("ADMIN_IDS", "")),
+        database_url=normalize_db_url(os.getenv("DATABASE_URL", "")),
+        bot_name=os.getenv("BOT_NAME", "Kage Dub").strip(),
+        bot_username=os.getenv("BOT_USERNAME", "Kage_Dub_bot").strip().lstrip("@"),
+        default_sub_channel=os.getenv("DEFAULT_SUB_CHANNEL", "").strip(),
+        base_url=base_url,
+        webhook_secret=secret,
+        port=int(os.getenv("PORT", "8080")),
+        timezone=os.getenv("TIMEZONE", "Asia/Tashkent").strip(),
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# BAZA: JADVALLAR
+# ════════════════════════════════════════════════════════════════════════════
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def as_utc(dt: datetime | None) -> datetime | None:
+    """SQLite vaqtni 'naive' qaytaradi, shuning uchun UTC ga keltiramiz."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    full_name: Mapped[str] = mapped_column(String(255), default="")
+    username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lang: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    vip_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    banned_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class Admin(Base):
+    __tablename__ = "admins"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Genre(Base):
+    __tablename__ = "genres"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True)
+
+
+class AnimeGenre(Base):
+    __tablename__ = "anime_genres"
+
+    anime_id: Mapped[int] = mapped_column(ForeignKey("animes.id", ondelete="CASCADE"), primary_key=True)
+    genre_id: Mapped[int] = mapped_column(
+        ForeignKey("genres.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+
+
+class Anime(Base):
+    """id — bu anime kodi (1, 2, 3 ... avtomatik)."""
+
+    __tablename__ = "animes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(255), index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    poster: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_vip: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    views: Mapped[int] = mapped_column(Integer, default=0)
+
+    genres: Mapped[list[Genre]] = relationship(
+        secondary="anime_genres", lazy="selectin", order_by="Genre.name"
+    )
+
+
+class Episode(Base):
+    __tablename__ = "episodes"
+    __table_args__ = (UniqueConstraint("anime_id", "number", name="uq_episode_number"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    anime_id: Mapped[int] = mapped_column(ForeignKey("animes.id", ondelete="CASCADE"), index=True)
+    number: Mapped[int] = mapped_column(Integer)
+    file_id: Mapped[str] = mapped_column(String(255))
+    file_type: Mapped[str] = mapped_column(String(16), default="video")  # video | document
+    views: Mapped[int] = mapped_column(Integer, default=0)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Favorite(Base):
+    __tablename__ = "favorites"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    anime_id: Mapped[int] = mapped_column(ForeignKey("animes.id", ondelete="CASCADE"), primary_key=True)
+
+
+class Channel(Base):
+    """kind='sub' — majburiy obuna kanali, kind='post' — post yuboriladigan kanal/guruh."""
+
+    __tablename__ = "channels"
+    __table_args__ = (UniqueConstraint("kind", "chat_id", name="uq_channel_kind_chat"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(8), index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    title: Mapped[str] = mapped_column(String(255), default="")
+    username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    invite_link: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+class Setting(Base):
+    __tablename__ = "settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+
+
+class ScheduledPost(Base):
+    __tablename__ = "scheduled_posts"
+    __table_args__ = (Index("ix_sched_due", "done", "run_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    anime_id: Mapped[int] = mapped_column(Integer)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    channel_title: Mapped[str] = mapped_column(String(255), default="")
+    run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    done: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    plan_title: Mapped[str] = mapped_column(String(64))
+    days: Mapped[int] = mapped_column(Integer)
+    amount: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(12), default="pending")  # pending|approved|rejected
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# BAZA: ULANISH
+# ════════════════════════════════════════════════════════════════════════════
+
+engine: AsyncEngine | None = None
+SessionLocal: async_sessionmaker | None = None
+
+
+def init_engine(url: str) -> None:
+    global engine, SessionLocal
+    kwargs: dict = {"pool_pre_ping": True}
+    if url.startswith("postgresql"):
+        # 50 000+ foydalanuvchi uchun yetarli ulanishlar havzasi
+        kwargs.update(pool_size=10, max_overflow=20, pool_recycle=1800)
+    engine = create_async_engine(url, **kwargs)
+    SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def create_tables() -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def close_engine() -> None:
+    if engine is not None:
+        await engine.dispose()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# BAZA: SO'ROVLAR (repo)
+# ════════════════════════════════════════════════════════════════════════════
+
+# ───────────────────────────── Foydalanuvchilar ─────────────────────────────
+
+
+async def _get_or_create(s, uid: int) -> User:
+    user = await s.get(User, uid)
+    if user is None:
+        user = User(id=uid, full_name="")
+        s.add(user)
+    return user
+
+
+def _like(q: str) -> str:
+    return "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+class repo:
+    """Bazadagi barcha so'rovlar (repo.nom() ko'rinishida chaqiriladi)."""
+    @staticmethod
+    async def upsert_user(uid: int, full_name: str, username: str | None) -> bool:
+        """Foydalanuvchini saqlaydi. Yangi bo'lsa True qaytaradi."""
+        try:
+            async with SessionLocal() as s, s.begin():
+                user = await s.get(User, uid)
+                if user is None:
+                    s.add(User(id=uid, full_name=(full_name or "")[:255], username=username))
+                    return True
+                user.full_name = (full_name or "")[:255]
+                user.username = username
+                user.is_blocked = False
+                return False
+        except IntegrityError:  # ikki so'rov bir vaqtda kelgan holat
+            return False
+
+
+    @staticmethod
+    async def get_user(uid: int) -> User | None:
+        async with SessionLocal() as s:
+            return await s.get(User, uid)
+
+
+
+
+    @staticmethod
+    async def set_lang(uid: int, lang: str) -> None:
+        async with SessionLocal() as s, s.begin():
+            user = await _get_or_create(s, uid)
+            user.lang = lang
+
+
+    @staticmethod
+    async def load_users_light() -> list[tuple[int, str | None]]:
+        async with SessionLocal() as s:
+            rows = await s.execute(select(User.id, User.lang))
+            return [(r[0], r[1]) for r in rows]
+
+
+    @staticmethod
+    async def mark_blocked(ids: list[int]) -> None:
+        if not ids:
+            return
+        async with SessionLocal() as s, s.begin():
+            await s.execute(update(User).where(User.id.in_(ids)).values(is_blocked=True))
+
+
+    @staticmethod
+    async def broadcast_ids() -> list[int]:
+        async with SessionLocal() as s:
+            rows = await s.scalars(
+                select(User.id).where(
+                    User.is_blocked.is_(False),
+                    or_(User.banned_until.is_(None), User.banned_until <= utcnow()),
+                )
+            )
+            return list(rows)
+
+
+    # ───────────────────────────── Ban ─────────────────────────────
+    @staticmethod
+    async def ban_user(uid: int, until: datetime) -> None:
+        async with SessionLocal() as s, s.begin():
+            user = await _get_or_create(s, uid)
+            user.banned_until = until
+
+
+    @staticmethod
+    async def unban_user(uid: int) -> bool:
+        async with SessionLocal() as s, s.begin():
+            user = await s.get(User, uid)
+            if user is None or user.banned_until is None:
+                return False
+            user.banned_until = None
+            return True
+
+
+    @staticmethod
+    async def active_bans() -> dict[int, datetime]:
+        async with SessionLocal() as s:
+            rows = await s.execute(
+                select(User.id, User.banned_until).where(User.banned_until > utcnow())
+            )
+            return {r[0]: as_utc(r[1]) for r in rows}
+
+
+    # ───────────────────────────── VIP ─────────────────────────────
+    @staticmethod
+    async def add_vip(uid: int, days: int) -> datetime:
+        async with SessionLocal() as s, s.begin():
+            user = await _get_or_create(s, uid)
+            base = max(utcnow(), as_utc(user.vip_until) or utcnow())
+            user.vip_until = base + timedelta(days=days)
+            return user.vip_until
+
+
+    @staticmethod
+    async def remove_vip(uid: int) -> bool:
+        async with SessionLocal() as s, s.begin():
+            user = await s.get(User, uid)
+            if user is None or user.vip_until is None:
+                return False
+            user.vip_until = None
+            return True
+
+
+    @staticmethod
+    async def is_vip_active(uid: int) -> bool:
+        user = await repo.get_user(uid)
+        until = as_utc(user.vip_until) if user else None
+        return bool(until and until > utcnow())
+
+
+    # ───────────────────────────── Adminlar ─────────────────────────────
+    @staticmethod
+    async def list_admin_ids() -> list[int]:
+        async with SessionLocal() as s:
+            return list(await s.scalars(select(Admin.user_id).order_by(Admin.added_at)))
+
+
+    @staticmethod
+    async def add_admin(uid: int) -> bool:
+        try:
+            async with SessionLocal() as s, s.begin():
+                if await s.get(Admin, uid):
+                    return False
+                s.add(Admin(user_id=uid))
+                return True
+        except IntegrityError:
+            return False
+
+
+    @staticmethod
+    async def remove_admin(uid: int) -> bool:
+        async with SessionLocal() as s, s.begin():
+            res = await s.execute(delete(Admin).where(Admin.user_id == uid))
+            return res.rowcount > 0
+
+
+    # ───────────────────────────── Janrlar ─────────────────────────────
+    @staticmethod
+    async def list_genres() -> list[Genre]:
+        async with SessionLocal() as s:
+            return list(await s.scalars(select(Genre).order_by(Genre.name)))
+
+
+    @staticmethod
+    async def get_genre(gid: int) -> Genre | None:
+        async with SessionLocal() as s:
+            return await s.get(Genre, gid)
+
+
+    @staticmethod
+    async def add_genre(name: str) -> Genre:
+        """Janr qo'shadi; bor bo'lsa mavjudini qaytaradi."""
+        name = name.strip()[:64]
+        async with SessionLocal() as s:
+            found = await s.scalar(select(Genre).where(func.lower(Genre.name) == name.lower()))
+            if found:
+                return found
+        try:
+            async with SessionLocal() as s, s.begin():
+                genre = Genre(name=name)
+                s.add(genre)
+            return genre
+        except IntegrityError:
+            async with SessionLocal() as s:
+                return await s.scalar(select(Genre).where(Genre.name == name))
+
+
+    @staticmethod
+    async def delete_genre(gid: int) -> None:
+        async with SessionLocal() as s, s.begin():
+            await s.execute(delete(AnimeGenre).where(AnimeGenre.genre_id == gid))
+            await s.execute(delete(Genre).where(Genre.id == gid))
+
+
+    # ───────────────────────────── Anime ─────────────────────────────
+    @staticmethod
+    async def create_anime(*, title: str, description: str, poster: str | None, year: int | None,
+                           is_vip: bool, created_by: int, genre_ids: list[int]) -> int:
+        async with SessionLocal() as s, s.begin():
+            anime = Anime(title=title, description=description, poster=poster, year=year,
+                          is_vip=is_vip, created_by=created_by)
+            s.add(anime)
+            await s.flush()
+            for gid in set(genre_ids):
+                s.add(AnimeGenre(anime_id=anime.id, genre_id=gid))
+            return anime.id
+
+
+    @staticmethod
+    async def get_anime(aid: int) -> Anime | None:
+        async with SessionLocal() as s:
+            return await s.get(Anime, aid)
+
+
+    @staticmethod
+    async def update_anime(aid: int, **fields) -> None:
+        async with SessionLocal() as s, s.begin():
+            await s.execute(update(Anime).where(Anime.id == aid).values(**fields))
+
+
+    @staticmethod
+    async def set_anime_genres(aid: int, genre_ids: list[int]) -> None:
+        async with SessionLocal() as s, s.begin():
+            await s.execute(delete(AnimeGenre).where(AnimeGenre.anime_id == aid))
+            for gid in set(genre_ids):
+                s.add(AnimeGenre(anime_id=aid, genre_id=gid))
+
+
+    @staticmethod
+    async def anime_genre_ids(aid: int) -> set[int]:
+        async with SessionLocal() as s:
+            rows = await s.scalars(select(AnimeGenre.genre_id).where(AnimeGenre.anime_id == aid))
+            return set(rows)
+
+
+    @staticmethod
+    async def delete_anime(aid: int) -> bool:
+        """Animeni va unga tegishli hamma narsani to'liq o'chiradi."""
+        async with SessionLocal() as s, s.begin():
+            await s.execute(delete(Episode).where(Episode.anime_id == aid))
+            await s.execute(delete(Favorite).where(Favorite.anime_id == aid))
+            await s.execute(delete(AnimeGenre).where(AnimeGenre.anime_id == aid))
+            await s.execute(delete(ScheduledPost).where(ScheduledPost.anime_id == aid))
+            res = await s.execute(delete(Anime).where(Anime.id == aid))
+            return res.rowcount > 0
+
+
+    @staticmethod
+    async def count_anime() -> int:
+        async with SessionLocal() as s:
+            return await s.scalar(select(func.count(Anime.id))) or 0
+
+
+    @staticmethod
+    async def list_anime(offset: int, limit: int) -> list[Anime]:
+        async with SessionLocal() as s:
+            rows = await s.scalars(select(Anime).order_by(Anime.id.desc()).offset(offset).limit(limit))
+            return list(rows)
+
+
+
+
+    @staticmethod
+    async def search_anime(q: str, limit: int = 10) -> list[Anime]:
+        """Kod, nom yoki janr bo'yicha qidiradi."""
+        q = q.strip()
+        if not q:
+            return []
+        pattern = _like(q)
+        conds = [
+            Anime.title.ilike(pattern, escape="\\"),
+            Anime.id.in_(
+                select(AnimeGenre.anime_id)
+                .join(Genre, Genre.id == AnimeGenre.genre_id)
+                .where(Genre.name.ilike(pattern, escape="\\"))
+            ),
+        ]
+        if q.isdigit() and len(q) <= 9:
+            conds.append(Anime.id == int(q))
+        async with SessionLocal() as s:
+            rows = await s.scalars(select(Anime).where(or_(*conds)).order_by(Anime.id.desc()).limit(limit))
+            return list(rows)
+
+
+    @staticmethod
+    async def anime_by_genre(gid: int, offset: int, limit: int) -> tuple[list[Anime], int]:
+        async with SessionLocal() as s:
+            base = select(AnimeGenre.anime_id).where(AnimeGenre.genre_id == gid)
+            total = await s.scalar(select(func.count()).select_from(base.subquery())) or 0
+            rows = await s.scalars(
+                select(Anime).where(Anime.id.in_(base)).order_by(Anime.id.desc()).offset(offset).limit(limit)
+            )
+            return list(rows), total
+
+
+    @staticmethod
+    async def add_anime_view(aid: int) -> None:
+        async with SessionLocal() as s, s.begin():
+            await s.execute(update(Anime).where(Anime.id == aid).values(views=Anime.views + 1))
+
+
+    # ───────────────────────────── Qismlar ─────────────────────────────
+    @staticmethod
+    async def last_episode_number(aid: int) -> int:
+        async with SessionLocal() as s:
+            return await s.scalar(select(func.max(Episode.number)).where(Episode.anime_id == aid)) or 0
+
+
+    @staticmethod
+    async def add_episode(aid: int, file_id: str, file_type: str) -> int:
+        """Keyingi raqam bilan qism qo'shadi (1, 2, 3 ... avtomatik) va raqamini qaytaradi."""
+        for _ in range(5):
+            try:
+                async with SessionLocal() as s, s.begin():
+                    last = await s.scalar(
+                        select(func.max(Episode.number)).where(Episode.anime_id == aid)
+                    ) or 0
+                    s.add(Episode(anime_id=aid, number=last + 1, file_id=file_id, file_type=file_type))
+                    return last + 1
+            except IntegrityError:
+                continue
+        raise RuntimeError("Qism raqamini belgilab bo'lmadi")
+
+
+    @staticmethod
+    async def list_episode_numbers(aid: int) -> list[int]:
+        async with SessionLocal() as s:
+            return list(await s.scalars(
+                select(Episode.number).where(Episode.anime_id == aid).order_by(Episode.number)
+            ))
+
+
+    @staticmethod
+    async def get_episode(aid: int, number: int) -> Episode | None:
+        async with SessionLocal() as s:
+            return await s.scalar(
+                select(Episode).where(Episode.anime_id == aid, Episode.number == number)
+            )
+
+
+    @staticmethod
+    async def delete_episode(aid: int, number: int) -> bool:
+        async with SessionLocal() as s, s.begin():
+            res = await s.execute(
+                delete(Episode).where(Episode.anime_id == aid, Episode.number == number)
+            )
+            return res.rowcount > 0
+
+
+    @staticmethod
+    async def replace_episode(aid: int, number: int, file_id: str, file_type: str) -> None:
+        async with SessionLocal() as s, s.begin():
+            await s.execute(
+                update(Episode).where(Episode.anime_id == aid, Episode.number == number)
+                .values(file_id=file_id, file_type=file_type)
+            )
+
+
+    @staticmethod
+    async def add_episode_view(aid: int, number: int) -> None:
+        async with SessionLocal() as s, s.begin():
+            await s.execute(
+                update(Episode).where(Episode.anime_id == aid, Episode.number == number)
+                .values(views=Episode.views + 1)
+            )
+
+
+    # ───────────────────────────── Sevimlilar ─────────────────────────────
+    @staticmethod
+    async def toggle_favorite(uid: int, aid: int) -> bool:
+        """Qo'shilsa True, olib tashlansa False."""
+        async with SessionLocal() as s, s.begin():
+            row = await s.get(Favorite, (uid, aid))
+            if row:
+                await s.delete(row)
+                return False
+            s.add(Favorite(user_id=uid, anime_id=aid))
+            return True
+
+
+    @staticmethod
+    async def is_favorite(uid: int, aid: int) -> bool:
+        async with SessionLocal() as s:
+            return await s.get(Favorite, (uid, aid)) is not None
+
+
+    @staticmethod
+    async def list_favorites(uid: int, offset: int, limit: int) -> tuple[list[Anime], int]:
+        async with SessionLocal() as s:
+            base = select(Favorite.anime_id).where(Favorite.user_id == uid)
+            total = await s.scalar(select(func.count()).select_from(base.subquery())) or 0
+            rows = await s.scalars(
+                select(Anime).where(Anime.id.in_(base)).order_by(Anime.id.desc()).offset(offset).limit(limit)
+            )
+            return list(rows), total
+
+
+    # ───────────────────────────── Kanallar ─────────────────────────────
+    @staticmethod
+    async def add_channel(kind: str, chat_id: int, title: str, username: str | None,
+                          invite_link: str | None) -> Channel | None:
+        try:
+            async with SessionLocal() as s, s.begin():
+                exists = await s.scalar(
+                    select(Channel).where(Channel.kind == kind, Channel.chat_id == chat_id)
+                )
+                if exists:
+                    return None
+                ch = Channel(kind=kind, chat_id=chat_id, title=title[:255], username=username,
+                             invite_link=invite_link)
+                s.add(ch)
+            return ch
+        except IntegrityError:
+            return None
+
+
+    @staticmethod
+    async def list_channels(kind: str) -> list[Channel]:
+        async with SessionLocal() as s:
+            return list(await s.scalars(select(Channel).where(Channel.kind == kind).order_by(Channel.id)))
+
+
+    @staticmethod
+    async def get_channel(cid: int) -> Channel | None:
+        async with SessionLocal() as s:
+            return await s.get(Channel, cid)
+
+
+    @staticmethod
+    async def remove_channel(cid: int) -> bool:
+        async with SessionLocal() as s, s.begin():
+            res = await s.execute(delete(Channel).where(Channel.id == cid))
+            return res.rowcount > 0
+
+
+    # ───────────────────────────── Sozlamalar ─────────────────────────────
+    @staticmethod
+    async def load_settings() -> dict[str, str]:
+        async with SessionLocal() as s:
+            rows = await s.execute(select(Setting.key, Setting.value))
+            return {r[0]: r[1] for r in rows}
+
+
+    @staticmethod
+    async def save_setting(key: str, value: str) -> None:
+        async with SessionLocal() as s, s.begin():
+            row = await s.get(Setting, key)
+            if row:
+                row.value = value
+            else:
+                s.add(Setting(key=key, value=value))
+
+
+    @staticmethod
+    async def delete_setting(key: str) -> None:
+        async with SessionLocal() as s, s.begin():
+            await s.execute(delete(Setting).where(Setting.key == key))
+
+
+    # ───────────────────────────── Rejalashtirilgan postlar ─────────────────────────────
+    @staticmethod
+    async def add_scheduled(anime_id: int, chat_id: int, channel_title: str, run_at: datetime,
+                            created_by: int) -> int:
+        async with SessionLocal() as s, s.begin():
+            item = ScheduledPost(anime_id=anime_id, chat_id=chat_id, channel_title=channel_title,
+                                 run_at=run_at, created_by=created_by)
+            s.add(item)
+            await s.flush()
+            return item.id
+
+
+    @staticmethod
+    async def due_scheduled(now: datetime) -> list[ScheduledPost]:
+        async with SessionLocal() as s:
+            rows = await s.scalars(
+                select(ScheduledPost).where(ScheduledPost.done.is_(False), ScheduledPost.run_at <= now)
+                .order_by(ScheduledPost.run_at).limit(50)
+            )
+            return list(rows)
+
+
+    @staticmethod
+    async def mark_scheduled_done(sid: int) -> None:
+        async with SessionLocal() as s, s.begin():
+            await s.execute(update(ScheduledPost).where(ScheduledPost.id == sid).values(done=True))
+
+
+    @staticmethod
+    async def list_scheduled(limit: int = 20) -> list[ScheduledPost]:
+        async with SessionLocal() as s:
+            rows = await s.scalars(
+                select(ScheduledPost).where(ScheduledPost.done.is_(False))
+                .order_by(ScheduledPost.run_at).limit(limit)
+            )
+            return list(rows)
+
+
+    @staticmethod
+    async def cancel_scheduled(sid: int) -> bool:
+        async with SessionLocal() as s, s.begin():
+            res = await s.execute(delete(ScheduledPost).where(ScheduledPost.id == sid))
+            return res.rowcount > 0
+
+
+    # ───────────────────────────── To'lovlar ─────────────────────────────
+    @staticmethod
+    async def create_payment(uid: int, plan_title: str, days: int, amount: int) -> int:
+        async with SessionLocal() as s, s.begin():
+            pay = Payment(user_id=uid, plan_title=plan_title[:64], days=days, amount=amount)
+            s.add(pay)
+            await s.flush()
+            return pay.id
+
+
+    @staticmethod
+    async def get_payment(pid: int) -> Payment | None:
+        async with SessionLocal() as s:
+            return await s.get(Payment, pid)
+
+
+    @staticmethod
+    async def set_payment_status(pid: int, status: str) -> bool:
+        """Faqat 'pending' holatdagi to'lovni o'zgartiradi (ikki marta bosishdan himoya)."""
+        async with SessionLocal() as s, s.begin():
+            res = await s.execute(
+                update(Payment).where(Payment.id == pid, Payment.status == "pending").values(status=status)
+            )
+            return res.rowcount > 0
+
+
+    # ───────────────────────────── Statistika ─────────────────────────────
+    @staticmethod
+    async def stats(day_start: datetime) -> dict[str, int]:
+        now = utcnow()
+        async with SessionLocal() as s:
+            async def one(query) -> int:
+                return await s.scalar(query) or 0
+
+            return {
+                "users": await one(select(func.count(User.id))),
+                "today": await one(select(func.count(User.id)).where(User.joined_at >= day_start)),
+                "week": await one(select(func.count(User.id)).where(User.joined_at >= now - timedelta(days=7))),
+                "blocked": await one(select(func.count(User.id)).where(User.is_blocked.is_(True))),
+                "vip": await one(select(func.count(User.id)).where(User.vip_until > now)),
+                "banned": await one(select(func.count(User.id)).where(User.banned_until > now)),
+                "anime": await one(select(func.count(Anime.id))),
+                "episodes": await one(select(func.count(Episode.id))),
+                "views": await one(select(func.coalesce(func.sum(Episode.views), 0))),
+            }
+
+
+    @staticmethod
+    async def top_anime(limit: int = 5) -> list[Anime]:
+        async with SessionLocal() as s:
+            rows = await s.scalars(select(Anime).order_by(Anime.views.desc()).limit(limit))
+            return list(rows)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# YORDAMCHI FUNKSIYALAR
+# ════════════════════════════════════════════════════════════════════════════
+
+esc = html.escape
+
+
+def tz() -> ZoneInfo:
+    return ZoneInfo(get_config().timezone)
+
+
+def short(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def pages_count(total: int, per_page: int) -> int:
+    return max(1, -(-total // per_page))
+
+
+def fmt_money(amount: int) -> str:
+    return f"{amount:,}".replace(",", " ")
+
+
+def fmt_dt(dt: datetime) -> str:
+    """UTC vaqtni mahalliy (Toshkent) ko'rinishga o'giradi."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz()).strftime("%d.%m.%Y %H:%M")
+
+
+def day_start_utc() -> datetime:
+    local = datetime.now(tz()).replace(hour=0, minute=0, second=0, microsecond=0)
+    return local.astimezone(timezone.utc)
+
+
+# ── Muddat: "2 kun", "4 soat", "1 kun 6 soat", "30 daqiqa", "abadiy" ──
+_UNITS = {
+    "daqiqa": 60, "daq": 60, "min": 60, "m": 60,
+    "soat": 3600, "s": 3600, "h": 3600,
+    "kun": 86400, "k": 86400, "d": 86400,
+    "hafta": 604800, "h.": 604800,
+    "oy": 2592000,
+}
+_DUR_RE = re.compile(r"(\d+)\s*([a-zA-Z']+)")
+
+
+def parse_duration(text: str) -> timedelta | None:
+    text = (text or "").strip().lower()
+    if text in {"abadiy", "umrbod", "forever"}:
+        return timedelta(days=36500)
+    seconds = 0
+    found = False
+    for number, unit in _DUR_RE.findall(text):
+        factor = _UNITS.get(unit)
+        if factor is None:
+            return None
+        seconds += int(number) * factor
+        found = True
+    if not found or seconds <= 0:
+        return None
+    return timedelta(seconds=min(seconds, 36500 * 86400))
+
+
+def fmt_duration(delta: timedelta) -> str:
+    total = int(delta.total_seconds())
+    if total >= 36000 * 86400:
+        return "abadiy"
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    parts = []
+    if days:
+        parts.append(f"{days} kun")
+    if hours:
+        parts.append(f"{hours} soat")
+    if minutes and not days:
+        parts.append(f"{minutes} daqiqa")
+    return " ".join(parts) or "1 daqiqadan kam"
+
+
+def parse_local_datetime(text: str) -> datetime | None:
+    """'2026-11-05 20:30' yoki '05.11.2026 20:30' (mahalliy vaqt) -> UTC."""
+    text = (text or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M"):
+        try:
+            naive = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        return naive.replace(tzinfo=tz()).astimezone(timezone.utc)
+    return None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# KESH VA ROLLAR
+# ════════════════════════════════════════════════════════════════════════════
+
+class Cache:
+    def __init__(self) -> None:
+        self.admins: set[int] = set()
+        self.bans: dict[int, datetime] = {}
+        self.langs: dict[int, str] = {}
+        self.known: set[int] = set()
+        self.sub_ok: dict[int, float] = {}          # user_id -> obuna tasdiqi amal qilish muddati
+        self.sub_channels: list[Channel] = []
+        self.settings: dict[str, str] = {}
+        self.ban_notified: dict[int, float] = {}
+        self.bot_username: str = ""
+
+    def cleanup(self) -> None:
+        now = time.monotonic()
+        self.sub_ok = {k: v for k, v in self.sub_ok.items() if v > now}
+        self.ban_notified = {k: v for k, v in self.ban_notified.items() if v > now}
+
+
+cache = Cache()
+
+
+def is_owner(uid: int) -> bool:
+    return uid == get_config().owner_id
+
+
+def is_staff(uid: int) -> bool:
+    return is_owner(uid) or uid in cache.admins
+
+
+def lang_of(uid: int) -> str:
+    return cache.langs.get(uid, "uz")
+
+
+def bot_username() -> str:
+    return cache.bot_username or get_config().bot_username
+
+
+def setting(key: str, default: str = "") -> str:
+    return cache.settings.get(key, default)
+
+
+async def set_setting(key: str, value: str) -> None:
+    await repo.save_setting(key, value)
+    cache.settings[key] = value
+
+
+async def del_setting(key: str) -> None:
+    await repo.delete_setting(key)
+    cache.settings.pop(key, None)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# FSM HOLATLARI
+# ════════════════════════════════════════════════════════════════════════════
+
+class SearchSt(StatesGroup):
+    query = State()
+
+
+class VipPay(StatesGroup):
+    receipt = State()
+
+
+class AddAnime(StatesGroup):
+    title = State()
+    description = State()
+    poster = State()
+    genres = State()
+    new_genre = State()
+    year = State()
+    vip = State()
+
+
+class AddEpisodes(StatesGroup):
+    upload = State()
+
+
+class EditAnime(StatesGroup):
+    value = State()
+
+
+class ReplaceEp(StatesGroup):
+    file = State()
+
+
+class AdminFind(StatesGroup):
+    query = State()
+
+
+class NewGenre(StatesGroup):
+    name = State()
+
+
+class PostSchedule(StatesGroup):
+    when = State()
+
+
+class AddChannel(StatesGroup):
+    ref = State()
+
+
+class AddAdmin(StatesGroup):
+    uid = State()
+
+
+class BanSt(StatesGroup):
+    ban = State()
+    unban = State()
+
+
+class BroadcastSt(StatesGroup):
+    message = State()
+
+
+class SetCard(StatesGroup):
+    number = State()
+    holder = State()
+
+
+class SetPlans(StatesGroup):
+    text = State()
+
+
+class GiveVip(StatesGroup):
+    data = State()
+
+
+class RemoveVip(StatesGroup):
+    uid = State()
+
+
+class SetTemplate(StatesGroup):
+    text = State()
+
+
+class SetInstagram(StatesGroup):
+    url = State()
+
+
+class SetSticker(StatesGroup):
+    sticker = State()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ROL FILTRLARI
+# ════════════════════════════════════════════════════════════════════════════
+
+class IsStaff(BaseFilter):
+    """Admin yoki Owner."""
+
+    async def __call__(self, event: TelegramObject) -> bool:
+        user = getattr(event, "from_user", None)
+        return bool(user and is_staff(user.id))
+
+
+class IsOwner(BaseFilter):
+    """Faqat Owner."""
+
+    async def __call__(self, event: TelegramObject) -> bool:
+        user = getattr(event, "from_user", None)
+        return bool(user and is_owner(user.id))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# UI YORDAMCHILARI
+# ════════════════════════════════════════════════════════════════════════════
+
+async def render(event: Message | CallbackQuery, text: str,
+                 kb: InlineKeyboardMarkup | None = None) -> Message | None:
+    """Callback bo'lsa xabarni tahrirlaydi (iloji bo'lmasa yangisini yuboradi), Message bo'lsa javob beradi."""
+    if isinstance(event, CallbackQuery):
+        msg = event.message
+        if msg is None:
+            return None
+        try:
+            return await msg.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc):
+                return msg
+            try:
+                await msg.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            return await msg.answer(text, reply_markup=kb)
+    return await event.answer(text, reply_markup=kb)
+
+
+async def send_slot_sticker(bot: Bot, chat_id: int, slot: str) -> None:
+    """Owner o'rnatgan stikerni yuboradi (o'rnatilmagan bo'lsa jim o'tadi)."""
+    file_id = setting(f"sticker_{slot}")
+    if not file_id:
+        return
+    try:
+        await bot.send_sticker(chat_id, file_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Stiker yuborilmadi (%s): %s", slot, exc)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TUGMALAR: UMUMIY
+# ════════════════════════════════════════════════════════════════════════════
+
+def B(text: str, data: str | None = None, url: str | None = None,
+      style: str | None = None) -> InlineKeyboardButton:
+    kwargs: dict = {"text": text}
+    if url:
+        kwargs["url"] = url
+    else:
+        kwargs["callback_data"] = data or "noop"
+    if style:
+        kwargs["style"] = style
+    return InlineKeyboardButton(**kwargs)
+
+
+def markup(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def pager(prefix: str, page: int, pages: int) -> list[InlineKeyboardButton]:
+    """◀️ 2/5 ▶️ qatori. Callback: '{prefix}:{sahifa}'."""
+    if pages <= 1:
+        return []
+    row: list[InlineKeyboardButton] = []
+    if page > 0:
+        row.append(B("◀️", f"{prefix}:{page - 1}", style="primary"))
+    row.append(B(f"{page + 1}/{pages}", "noop"))
+    if page < pages - 1:
+        row.append(B("▶️", f"{prefix}:{page + 1}", style="primary"))
+    return row
+
+
+def cancel_kb(lang: str = "uz") -> InlineKeyboardMarkup:
+    return markup([[B(t(lang, "btn_cancel"), "cancel", style="danger")]])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TUGMALAR: FOYDALANUVCHI
+# ════════════════════════════════════════════════════════════════════════════
+
+EP_PER_PAGE = 30
+EP_COLUMNS = 5
+
+
+def lang_kb(payload: str = "") -> InlineKeyboardMarkup:
+    return markup([[
+        B("🇺🇿 O'zbekcha", f"lang:uz:{payload}", style="primary"),
+        B("🇷🇺 Русский", f"lang:ru:{payload}", style="primary"),
+    ]])
+
+
+def main_menu(lang: str, staff: bool) -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardBuilder()
+    kb.row(KeyboardButton(text=t(lang, "btn_animes"), style="primary"),
+           KeyboardButton(text=t(lang, "btn_search"), style="primary"))
+    kb.row(KeyboardButton(text=t(lang, "btn_genres"), style="primary"),
+           KeyboardButton(text=t(lang, "btn_fav"), style="primary"))
+    kb.row(KeyboardButton(text=t(lang, "btn_vip"), style="success"),
+           KeyboardButton(text=t(lang, "btn_lang")))
+    if staff:
+        kb.row(KeyboardButton(text=PANEL_BTN, style="danger"))
+    return kb.as_markup(resize_keyboard=True, input_field_placeholder=t(lang, "menu_hint"))
+
+
+def sub_kb(channels: list[Channel], payload: str, lang: str) -> InlineKeyboardMarkup:
+    rows = []
+    for ch in channels:
+        link = ch.invite_link or (f"https://t.me/{ch.username}" if ch.username else None)
+        if link:
+            rows.append([B(f"📢 {short(ch.title, 40)}", url=link, style="primary")])
+    rows.append([B(t(lang, "sub_check_btn"), f"chk:{payload}", style="success")])
+    return markup(rows)
+
+
+def anime_label(a: Anime) -> str:
+    return f"{'💎 ' if a.is_vip else ''}{short(a.title, 45)} · #{a.id}"
+
+
+def anime_list_kb(items: list[Anime], page: int, pages: int, prefix: str,
+                  extra: list[list] | None = None, cb: str = "an") -> InlineKeyboardMarkup:
+    rows = [[B(anime_label(a), f"{cb}:{a.id}")] for a in items]
+    nav = pager(prefix, page, pages)
+    if nav:
+        rows.append(nav)
+    rows.extend(extra or [])
+    return markup(rows)
+
+
+def genres_kb(genres: list[Genre]) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for g in genres:
+        row.append(B(f"🎭 {short(g.name, 20)}", f"gn:{g.id}:0"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return markup(rows)
+
+
+def anime_kb(anime_id: int, eps: list[int], page: int, fav: bool, lang: str) -> InlineKeyboardMarkup:
+    rows = []
+    chunk = eps[page * EP_PER_PAGE:(page + 1) * EP_PER_PAGE]
+    for i in range(0, len(chunk), EP_COLUMNS):
+        rows.append([B(f"{n}", f"ep:{anime_id}:{n}") for n in chunk[i:i + EP_COLUMNS]])
+    pages = max(1, -(-len(eps) // EP_PER_PAGE))
+    nav = pager(f"epp:{anime_id}", page, pages)
+    if nav:
+        rows.append(nav)
+    if fav:
+        rows.append([B(t(lang, "fav_remove"), f"fav:{anime_id}:{page}", style="danger")])
+    else:
+        rows.append([B(t(lang, "fav_add"), f"fav:{anime_id}:{page}", style="success")])
+    return markup(rows)
+
+
+def episode_nav_kb(anime_id: int, prev_n: int | None, next_n: int | None, lang: str) -> InlineKeyboardMarkup:
+    row = []
+    if prev_n is not None:
+        row.append(B(t(lang, "ep_prev"), f"epn:{anime_id}:{prev_n}", style="primary"))
+    if next_n is not None:
+        row.append(B(t(lang, "ep_next"), f"epn:{anime_id}:{next_n}", style="primary"))
+    rows = [row] if row else []
+    rows.append([B(t(lang, "ep_all"), f"an:{anime_id}")])
+    return markup(rows)
+
+
+def vip_buy_kb(lang: str) -> InlineKeyboardMarkup:
+    return markup([[B(t(lang, "btn_buy_vip"), "vip:open", style="success")]])
+
+
+def vip_plans_kb(plans: list[dict], lang: str) -> InlineKeyboardMarkup:
+    rows = [[B(f"💎 {p['title']} — {fmt_money(p['price'])} so'm", f"vp:{i}", style="success")]
+            for i, p in enumerate(plans)]
+    return markup(rows)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TUGMALAR: ADMIN/OWNER
+# ════════════════════════════════════════════════════════════════════════════
+
+PER_PAGE = 8
+
+
+def panel_kb(owner: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [B("🎬 Anime qo'shish", "adm:addanime", style="success"),
+         B("📚 Animelar", "adm:anime:0", style="primary")],
+        [B("🎭 Janrlar", "adm:genres"), B("📮 Post sozlamalarim", "adm:pset")],
+    ]
+    if owner:
+        rows += [
+            [B("📊 Statistika", "adm:stats"), B("📣 Xabar yuborish", "adm:bc")],
+            [B("📢 Majburiy obuna", "adm:ch:sub"), B("📡 Post kanallari", "adm:ch:post")],
+            [B("👮 Adminlar", "adm:admins"), B("🚫 Ban / Unban", "adm:ban")],
+            [B("💎 VIP boshqaruvi", "adm:vip"), B("🧩 Post shabloni", "adm:tpl")],
+            [B("🎟 Stikerlar", "adm:stk"), B("🕒 Rejalashtirilgan", "adm:sched")],
+        ]
+    return markup(rows)
+
+
+def back_panel() -> list:
+    return [B("⬅️ Panel", "adm:main")]
+
+
+def admin_anime_list_kb(items: list[Anime], page: int, pages: int) -> InlineKeyboardMarkup:
+    rows = [[B(f"{'💎 ' if a.is_vip else ''}{short(a.title, 40)} · #{a.id}", f"aa:{a.id}")] for a in items]
+    nav = pager("adm:anime", page, pages)
+    if nav:
+        rows.append(nav)
+    rows.append([B("🔎 Kod/nom bo'yicha topish", "adm:find", style="primary")])
+    rows.append(back_panel())
+    return markup(rows)
+
+
+def anime_admin_kb(anime_id: int, owner: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [B("➕ Qism qo'shish", f"aep:add:{anime_id}", style="success"),
+         B("📼 Qismlar", f"aep:list:{anime_id}:0", style="primary")],
+        [B("✏️ Tahrirlash", f"aed:{anime_id}"), B("📮 Post qilish", f"apost:{anime_id}")],
+        [B("👁 Foydalanuvchi ko'rinishi", f"anu:{anime_id}")],
+    ]
+    if owner:
+        rows.append([B("🗑 Animeni o'chirish", f"adel:{anime_id}", style="danger")])
+    rows.append([B("⬅️ Ro'yxat", "adm:anime:0")])
+    return markup(rows)
+
+
+def edit_menu_kb(anime_id: int, is_vip: bool) -> InlineKeyboardMarkup:
+    return markup([
+        [B("📝 Nomi", f"aef:{anime_id}:title"), B("📄 Tavsifi", f"aef:{anime_id}:description")],
+        [B("🖼 Rasmi", f"aef:{anime_id}:poster"), B("📅 Yili", f"aef:{anime_id}:year")],
+        [B("🎭 Janrlari", f"aeg:{anime_id}")],
+        [B("💎 VIP: yoqilgan ✅" if is_vip else "💎 VIP: o'chirilgan ❌", f"aevip:{anime_id}")],
+        [B("⬅️ Orqaga", f"aa:{anime_id}")],
+    ])
+
+
+def genre_toggle_kb(genres: list[Genre], selected: set[int], prefix: str,
+                    done_cb: str, new_cb: str | None) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for g in genres:
+        mark = "✅" if g.id in selected else "▫️"
+        row.append(B(f"{mark} {short(g.name, 18)}", f"{prefix}:{g.id}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    last = []
+    if new_cb:
+        last.append(B("➕ Yangi janr", new_cb, style="primary"))
+    last.append(B("➡️ Davom etish" if new_cb else "✅ Tayyor", done_cb, style="success"))
+    rows.append(last)
+    return markup(rows)
+
+
+def episodes_admin_kb(anime_id: int, eps: list[int], page: int) -> InlineKeyboardMarkup:
+    rows = []
+    chunk = eps[page * EP_PER_PAGE:(page + 1) * EP_PER_PAGE]
+    for i in range(0, len(chunk), EP_COLUMNS):
+        rows.append([B(f"{n}", f"aep:one:{anime_id}:{n}") for n in chunk[i:i + EP_COLUMNS]])
+    nav = pager(f"aep:list:{anime_id}", page, max(1, -(-len(eps) // EP_PER_PAGE)))
+    if nav:
+        rows.append(nav)
+    rows.append([B("➕ Qism qo'shish", f"aep:add:{anime_id}", style="success")])
+    rows.append([B("⬅️ Orqaga", f"aa:{anime_id}")])
+    return markup(rows)
+
+
+def episode_actions_kb(anime_id: int, n: int, owner: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [B("👁 Ko'rish", f"aep:view:{anime_id}:{n}"), B("🔄 Almashtirish", f"aep:rep:{anime_id}:{n}")],
+    ]
+    if owner:
+        rows.append([B("🗑 O'chirish", f"aep:del:{anime_id}:{n}", style="danger")])
+    rows.append([B("⬅️ Qismlar", f"aep:list:{anime_id}:0")])
+    return markup(rows)
+
+
+def channels_kb(kind: str, channels: list[Channel]) -> InlineKeyboardMarkup:
+    rows = [[B(f"🗑 {short(c.title, 35)}", f"chdel:{kind}:{c.id}", style="danger")] for c in channels]
+    rows.append([B("➕ Qo'shish", f"chadd:{kind}", style="success")])
+    rows.append(back_panel())
+    return markup(rows)
+
+
+def yes_no(yes_cb: str, no_cb: str) -> InlineKeyboardMarkup:
+    return markup([[B("✅ Ha", yes_cb, style="success"), B("❌ Yo'q", no_cb, style="danger")]])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# XIZMAT: MAJBURIY OBUNA
+# ════════════════════════════════════════════════════════════════════════════
+
+SUB_TTL = 300  # obuna tasdiqlangandan keyin 5 daqiqa qayta tekshirilmaydi (tezlik uchun)
+_JOINED = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
+
+
+async def refresh_channels() -> None:
+    cache.sub_channels = await repo.list_channels("sub")
+    cache.sub_ok.clear()
+
+
+async def _is_member(bot: Bot, channel: Channel, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(channel.chat_id, user_id)
+    except TelegramAPIError as exc:
+        # Bot kanalda admin emas yoki limit: foydalanuvchini qulflab qo'ymaymiz
+        logger.warning("Obuna tekshirib bo'lmadi (%s): %s", channel.title, exc)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("Obuna tekshiruvida kutilmagan xato")
+        return True
+    if member.status in _JOINED:
+        return True
+    return member.status == ChatMemberStatus.RESTRICTED and bool(getattr(member, "is_member", False))
+
+
+async def missing_channels(bot: Bot, user_id: int) -> list[Channel]:
+    """Foydalanuvchi obuna bo'lmagan kanallar ro'yxati (bo'sh bo'lsa hammasiga obuna)."""
+    channels = cache.sub_channels
+    if not channels:
+        return []
+    now = time.monotonic()
+    if cache.sub_ok.get(user_id, 0) > now:
+        return []
+    results = await asyncio.gather(*(_is_member(bot, ch, user_id) for ch in channels))
+    missing = [ch for ch, ok in zip(channels, results) if not ok]
+    if not missing:
+        cache.sub_ok[user_id] = now + SUB_TTL
+    return missing
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# XIZMAT: VIP TARIFLARI
+# ════════════════════════════════════════════════════════════════════════════
+
+# Boshlang'ich narxlar (so'm). Owner paneldan o'zgartira oladi.
+DEFAULT_PLANS = [
+    {"title": "1 oy", "days": 30, "price": 15000},
+    {"title": "3 oy", "days": 90, "price": 40000},
+    {"title": "6 oy", "days": 180, "price": 75000},
+    {"title": "12 oy", "days": 365, "price": 140000},
+]
+
+
+def get_plans() -> list[dict]:
+    raw = setting("vip_plans")
+    if raw:
+        try:
+            plans = json.loads(raw)
+            if isinstance(plans, list) and plans:
+                return plans
+        except ValueError:
+            pass
+    return DEFAULT_PLANS
+
+
+def parse_plans(text: str) -> list[dict] | None:
+    """Har qator: 'nomi|kun|narx'  (masalan: 1 oy|30|15000)."""
+    plans = []
+    for line in text.strip().splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].replace(" ", "").isdigit():
+            return None
+        title, days, price = parts[0][:30], int(parts[1]), int(parts[2].replace(" ", ""))
+        if not title or days <= 0 or price <= 0:
+            return None
+        plans.append({"title": title, "days": days, "price": price})
+    return plans[:8] or None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# XIZMAT: POST QILISH
+# ════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_TEMPLATE = (
+    "🎬 <b>{title}</b> {vip}\n\n"
+    "🎭 Janr: {genres}\n"
+    "📅 Yil: {year}\n"
+    "🆔 Kod: <code>{code}</code>\n\n"
+    "📝 {description}"
+)
+PLACEHOLDERS = "{title} {genres} {year} {code} {description} {vip}"
+_TAG = re.compile(r"<[^>]+>")
+
+
+class _Safe(dict):
+    def __missing__(self, key: str) -> str:  # noma'lum {kalit} o'z holicha qoladi
+        return "{" + key + "}"
+
+
+def render_caption(anime, poster_name: str | None = None, extra: str | None = None,
+                   template: str | None = None) -> str:
+    template = template or setting("post_template") or DEFAULT_TEMPLATE
+    limit = 700
+    while True:
+        fields = _Safe(
+            title=esc(anime.title),
+            genres=esc(", ".join(g.name for g in anime.genres) or "—"),
+            year=anime.year or "—",
+            code=anime.id,
+            vip="💎 VIP" if anime.is_vip else "",
+            description=esc(short(anime.description, limit)),
+        )
+        text = template.format_map(fields)
+        if extra:
+            text += f"\n\n{extra}"
+        if setting("post_show_poster") == "1" and poster_name:
+            text += f"\n\n👤 Post qildi: <b>{esc(poster_name)}</b>"
+        if len(_TAG.sub("", text)) <= 1000 or limit <= 60:
+            return text
+        limit -= 120
+
+
+def post_kb(anime_id: int) -> InlineKeyboardMarkup:
+    rows = [[B(t("uz", "watch_btn"),
+               url=f"https://t.me/{bot_username()}?start=a{anime_id}", style="success")]]
+    ig = setting("instagram_url")
+    if ig:
+        rows.append([B("📸 Instagram", url=ig, style="primary")])
+    return markup(rows)
+
+
+def sample_anime():
+    """Shablon namunasi uchun soxta anime."""
+    return SimpleNamespace(
+        id=1, title="Namuna anime", year=2024, is_vip=False, poster=None,
+        description="Bu shablon qanday ko'rinishini ko'rsatuvchi namuna tavsif.",
+        genres=[SimpleNamespace(name="Action"), SimpleNamespace(name="Drama")],
+    )
+
+
+async def send_post(bot: Bot, anime, chat_id: int, poster_name: str | None = None,
+                    extra: str | None = None) -> str | None:
+    """Muvaffaqiyatli bo'lsa None, aks holda xato matnini qaytaradi."""
+    caption = render_caption(anime, poster_name, extra)
+    kb = post_kb(anime.id)
+    for attempt in range(2):
+        try:
+            if anime.poster:
+                await bot.send_photo(chat_id, anime.poster, caption=caption, reply_markup=kb)
+            else:
+                await bot.send_message(chat_id, caption, reply_markup=kb)
+            return None
+        except TelegramRetryAfter as exc:
+            if attempt == 0:
+                await asyncio.sleep(exc.retry_after + 1)
+                continue
+            return str(exc)
+        except TelegramAPIError as exc:
+            return str(exc)
+    return "Noma'lum xato"
+
+
+async def auto_post(bot: Bot, anime, staff_id: int, poster_name: str | None,
+                    extra: str | None = None) -> list[str]:
+    """Admin avto-postni yoqqan bo'lsa, tanlagan kanallariga yuboradi. Hisobot qatorlarini qaytaradi."""
+    if setting(f"autopost:{staff_id}") != "1":
+        return []
+    chosen = {int(x) for x in setting(f"targets:{staff_id}").split(",") if x.strip().isdigit()}
+    lines = []
+    for ch in await repo.list_channels("post"):
+        if ch.id not in chosen:
+            continue
+        err = await send_post(bot, anime, ch.chat_id, poster_name, extra)
+        lines.append(f"✅ {esc(ch.title)}" if err is None else f"❌ {esc(ch.title)}: {esc(short(err, 80))}")
+    return lines
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# XIZMAT: BROADCAST
+# ════════════════════════════════════════════════════════════════════════════
+
+BATCH = 25
+
+
+async def _copy(bot: Bot, uid: int, from_chat: int, message_id: int) -> str:
+    for attempt in range(2):
+        try:
+            await bot.copy_message(uid, from_chat, message_id)
+            return "ok"
+        except TelegramForbiddenError:
+            return "blocked"
+        except TelegramRetryAfter as exc:
+            if attempt == 0:
+                await asyncio.sleep(exc.retry_after + 1)
+                continue
+            return "fail"
+        except TelegramAPIError:
+            return "fail"
+    return "fail"
+
+
+async def run_broadcast(bot: Bot, report_chat: int, from_chat: int, message_id: int,
+                        status: Message) -> None:
+    ids = await repo.broadcast_ids()
+    total = len(ids)
+    sent = failed = 0
+    blocked: list[int] = []
+    for start in range(0, total, BATCH):
+        chunk = ids[start:start + BATCH]
+        results = await asyncio.gather(*(_copy(bot, uid, from_chat, message_id) for uid in chunk))
+        for uid, res in zip(chunk, results):
+            if res == "ok":
+                sent += 1
+            elif res == "blocked":
+                blocked.append(uid)
+            else:
+                failed += 1
+        await asyncio.sleep(1.0)
+        if (start // BATCH) % 20 == 19:
+            try:
+                await status.edit_text(f"📣 Yuborilmoqda... {sent + failed + len(blocked)}/{total}")
+            except TelegramAPIError:
+                pass
+    await repo.mark_blocked(blocked)
+    text = (
+        "📣 <b>Xabar yuborish yakunlandi</b>\n\n"
+        f"👥 Jami: <b>{total}</b>\n✅ Yetkazildi: <b>{sent}</b>\n"
+        f"🚫 Botni bloklaganlar: <b>{len(blocked)}</b>\n⚠️ Xatolik: <b>{failed}</b>"
+    )
+    try:
+        await status.edit_text(text)
+    except TelegramAPIError:
+        await bot.send_message(report_chat, text)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# XIZMAT: REJALASHTIRGICH
+# ════════════════════════════════════════════════════════════════════════════
+
+CHECK_EVERY = 20  # soniya
+
+
+async def scheduler_loop(bot: Bot) -> None:
+    ticks = 0
+    while True:
+        try:
+            await asyncio.sleep(CHECK_EVERY)
+            ticks += 1
+            for item in await repo.due_scheduled(utcnow()):
+                await repo.mark_scheduled_done(item.id)  # ikki marta yuborilmasligi uchun avval belgilaymiz
+                anime = await repo.get_anime(item.anime_id)
+                if anime is None:
+                    continue
+                err = await send_post(bot, anime, item.chat_id)
+                if err:
+                    logger.warning("Rejalashtirilgan post yuborilmadi: %s", err)
+                    try:
+                        await bot.send_message(
+                            item.created_by,
+                            f"❌ Rejalashtirilgan post yuborilmadi\n🎬 {esc(anime.title)}\n"
+                            f"📡 {esc(item.channel_title)}\n⚠️ {esc(short(err, 120))}",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            if ticks % 30 == 0:
+                cache.cleanup()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("Scheduler xatosi")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MIDDLEWARE: BAN VA OBUNA
+# ════════════════════════════════════════════════════════════════════════════
+
+# Obuna tekshirilmaydigan tugmalar (til tanlash, "Tekshirish" va h.k.)
+_FREE_CALLBACKS = ("chk:", "lang:", "noop", "cancel")
+
+
+class AccessMiddleware(BaseMiddleware):
+    async def __call__(self, handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+                       event: TelegramObject, data: dict[str, Any]) -> Any:
+        user = data.get("event_from_user")
+        chat = data.get("event_chat")
+        if user is None or user.is_bot:
+            return await handler(event, data)
+        if chat is not None and chat.type != "private":
+            return None  # bot faqat shaxsiy chatda ishlaydi
+
+        uid = user.id
+        bot: Bot = data["bot"]
+
+        # 1) Ro'yxatga olish (faqat birinchi marta bazaga yoziladi)
+        if uid not in cache.known:
+            await repo.upsert_user(uid, user.full_name, user.username)
+            cache.known.add(uid)
+
+        # 2) Ban tekshiruvi
+        until = cache.bans.get(uid)
+        if until is not None and not is_owner(uid):
+            if until > utcnow():
+                await self._notify_banned(bot, uid, until)
+                if isinstance(event, CallbackQuery):
+                    await event.answer()
+                return None
+            cache.bans.pop(uid, None)
+
+        # 3) Majburiy obuna
+        if not is_staff(uid) and self._needs_check(event):
+            missing = await missing_channels(bot, uid)
+            if missing:
+                lang = lang_of(uid)
+                await bot.send_message(uid, t(lang, "sub_required"), reply_markup=sub_kb(missing, "", lang))
+                if isinstance(event, CallbackQuery):
+                    await event.answer()
+                return None
+
+        return await handler(event, data)
+
+    @staticmethod
+    def _needs_check(event: TelegramObject) -> bool:
+        if isinstance(event, Message):
+            text = event.text or ""
+            return not text.startswith("/start")
+        if isinstance(event, CallbackQuery):
+            return not (event.data or "").startswith(_FREE_CALLBACKS)
+        return False
+
+    @staticmethod
+    async def _notify_banned(bot: Bot, uid: int, until: datetime) -> None:
+        now = time.monotonic()
+        if cache.ban_notified.get(uid, 0) > now:
+            return  # 1 daqiqada bir martadan ko'p yozmaymiz
+        cache.ban_notified[uid] = now + 60
+        left = fmt_duration(until - utcnow())
+        try:
+            await send_slot_sticker(bot, uid, "ban")
+            await bot.send_message(uid, BAN_TEXT.format(left=left, until=fmt_dt(until)))
+        except Exception:  # noqa: BLE001
+            logger.debug("Ban xabarini yuborib bo'lmadi")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HANDLER: UMUMIY
+# ════════════════════════════════════════════════════════════════════════════
+
+common_router = Router(name="common")
+
+
+@common_router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(t(lang_of(message.from_user.id), "cancelled"))
+
+
+@common_router.callback_query(F.data == "cancel")
+async def cb_cancel(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await render(cb, t(lang_of(cb.from_user.id), "cancelled"))
+    await cb.answer()
+
+
+@common_router.callback_query(F.data == "noop")
+async def cb_noop(cb: CallbackQuery) -> None:
+    await cb.answer()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HANDLER: XATOLAR
+# ════════════════════════════════════════════════════════════════════════════
+
+errors_router = Router(name="errors")
+
+_IGNORED = ("message is not modified", "query is too old", "query ID is invalid",
+            "message to delete not found", "message can't be deleted")
+
+
+@errors_router.errors()
+async def on_error(event: ErrorEvent) -> bool:
+    exc = event.exception
+    if isinstance(exc, (TelegramForbiddenError, TelegramRetryAfter)):
+        return True
+    if isinstance(exc, TelegramBadRequest) and any(s in str(exc) for s in _IGNORED):
+        return True
+
+    logger.exception("Handlerda xatolik: %s", exc, exc_info=exc)
+    update = event.update
+    try:
+        if update.message:
+            await update.message.answer(t(lang_of(update.message.from_user.id), "error"))
+        elif update.callback_query:
+            await update.callback_query.answer(
+                t(lang_of(update.callback_query.from_user.id), "error"), show_alert=True)
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HANDLER: FOYDALANUVCHI (anime, qidiruv, qismlar)
+# ════════════════════════════════════════════════════════════════════════════
+
+user_router = Router(name="user_anime")
+fallback_router = Router(name="fallback")  # eng oxirida ulanadi
+
+
+async def has_vip(uid: int) -> bool:
+    return is_staff(uid) or await repo.is_vip_active(uid)
+
+
+# ───────────────────────────── Anime kartochkasi ─────────────────────────────
+def build_card(lang: str, anime, eps_count: int) -> str:
+    text = t(
+        lang, "card",
+        title=esc(anime.title), vip=" 💎" if anime.is_vip else "",
+        genres=esc(", ".join(g.name for g in anime.genres) or "—"),
+        year=anime.year or "—", code=anime.id, eps=eps_count, views=anime.views,
+        desc=esc(short(anime.description, 500)),
+    )
+    return text + (t(lang, "card_pick") if eps_count else t(lang, "card_no_eps"))
+
+
+async def show_anime(bot: Bot, chat_id: int, uid: int, lang: str, anime_id: int) -> None:
+    anime = await repo.get_anime(anime_id)
+    if anime is None:
+        await bot.send_message(chat_id, t(lang, "anime_missing"))
+        return
+    eps = await repo.list_episode_numbers(anime_id)
+    fav = await repo.is_favorite(uid, anime_id)
+    caption = build_card(lang, anime, len(eps))
+    markup_ = anime_kb(anime_id, eps, 0, fav, lang)
+    spawn(repo.add_anime_view(anime_id))
+    try:
+        if anime.poster:
+            await bot.send_photo(chat_id, anime.poster, caption=caption,
+                                 reply_markup=markup_, protect_content=True)
+            return
+    except TelegramBadRequest:
+        logger.warning("Anime #%s posteri yuborilmadi, matn bilan almashtirildi", anime_id)
+    await bot.send_message(chat_id, caption, reply_markup=markup_, protect_content=True)
+
+
+@user_router.callback_query(F.data.startswith("an:"))
+async def cb_anime(cb: CallbackQuery, bot: Bot) -> None:
+    await cb.answer()
+    await show_anime(bot, cb.message.chat.id, cb.from_user.id, lang_of(cb.from_user.id),
+                     int(cb.data.split(":")[1]))
+
+
+# ───────────────────────────── Barcha animelar ─────────────────────────────
+async def _all_list(page: int, lang: str):
+    total = await repo.count_anime()
+    if total == 0:
+        return t(lang, "list_empty"), None
+    pages = pages_count(total, PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    items = await repo.list_anime(page * PER_PAGE, PER_PAGE)
+    return t(lang, "list_title", total=total), anime_list_kb(items, page, pages, "al")
+
+
+@user_router.message(F.text.in_(variants("btn_animes")))
+async def menu_animes(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text, markup_ = await _all_list(0, lang_of(message.from_user.id))
+    await message.answer(text, reply_markup=markup_)
+
+
+@user_router.callback_query(F.data.startswith("al:"))
+async def cb_all_page(cb: CallbackQuery) -> None:
+    text, markup_ = await _all_list(int(cb.data.split(":")[1]), lang_of(cb.from_user.id))
+    await render(cb, text, markup_)
+    await cb.answer()
+
+
+# ───────────────────────────── Janrlar ─────────────────────────────
+async def _genres_view(lang: str):
+    genres = await repo.list_genres()
+    if not genres:
+        return t(lang, "genres_empty"), None
+    return t(lang, "genres_title"), genres_kb(genres)
+
+
+@user_router.message(F.text.in_(variants("btn_genres")))
+async def menu_genres(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text, markup_ = await _genres_view(lang_of(message.from_user.id))
+    await message.answer(text, reply_markup=markup_)
+
+
+@user_router.callback_query(F.data == "gl")
+async def cb_genres(cb: CallbackQuery) -> None:
+    text, markup_ = await _genres_view(lang_of(cb.from_user.id))
+    await render(cb, text, markup_)
+    await cb.answer()
+
+
+@user_router.callback_query(F.data.startswith("gn:"))
+async def cb_genre_list(cb: CallbackQuery) -> None:
+    _, gid, page = cb.data.split(":")
+    lang = lang_of(cb.from_user.id)
+    genre = await repo.get_genre(int(gid))
+    if genre is None:
+        await cb.answer(t(lang, "genres_empty"), show_alert=True)
+        return
+    items, total = await repo.anime_by_genre(int(gid), int(page) * PER_PAGE, PER_PAGE)
+    back = [[B(t(lang, "back"), "gl")]]
+    if total == 0:
+        await render(cb, t(lang, "genre_list_empty"), markup(back))
+    else:
+        pages = pages_count(total, PER_PAGE)
+        await render(cb, t(lang, "genre_list_title", genre=esc(genre.name), total=total),
+                     anime_list_kb(items, int(page), pages, f"gn:{gid}", extra=back))
+    await cb.answer()
+
+
+# ───────────────────────────── Sevimlilar ─────────────────────────────
+async def _fav_view(uid: int, page: int, lang: str):
+    items, total = await repo.list_favorites(uid, page * PER_PAGE, PER_PAGE)
+    if total == 0:
+        return t(lang, "fav_empty"), None
+    pages = pages_count(total, PER_PAGE)
+    return t(lang, "fav_title", total=total), anime_list_kb(items, page, pages, "fv")
+
+
+@user_router.message(F.text.in_(variants("btn_fav")))
+async def menu_fav(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text, markup_ = await _fav_view(message.from_user.id, 0, lang_of(message.from_user.id))
+    await message.answer(text, reply_markup=markup_)
+
+
+@user_router.callback_query(F.data.startswith("fv:"))
+async def cb_fav_page(cb: CallbackQuery) -> None:
+    text, markup_ = await _fav_view(cb.from_user.id, int(cb.data.split(":")[1]), lang_of(cb.from_user.id))
+    await render(cb, text, markup_)
+    await cb.answer()
+
+
+@user_router.callback_query(F.data.startswith("fav:"))
+async def cb_fav_toggle(cb: CallbackQuery) -> None:
+    _, aid, page = cb.data.split(":")
+    uid, lang = cb.from_user.id, lang_of(cb.from_user.id)
+    added = await repo.toggle_favorite(uid, int(aid))
+    eps = await repo.list_episode_numbers(int(aid))
+    try:
+        await cb.message.edit_reply_markup(reply_markup=anime_kb(int(aid), eps, int(page), added, lang))
+    except TelegramBadRequest:
+        pass
+    await cb.answer(t(lang, "fav_added" if added else "fav_removed"))
+
+
+# ───────────────────────────── Qidiruv ─────────────────────────────
+async def do_search(message: Message, query: str) -> None:
+    lang = lang_of(message.from_user.id)
+    results = await repo.search_anime(query, limit=10)
+    if not results:
+        await message.answer(t(lang, "search_none"))
+        return
+    if len(results) == 1 and query.strip().isdigit():
+        await show_anime(message.bot, message.chat.id, message.from_user.id, lang, results[0].id)
+        return
+    await message.answer(t(lang, "search_found"),
+                         reply_markup=anime_list_kb(results, 0, 1, "al"))
+
+
+@user_router.message(F.text.in_(variants("btn_search")))
+async def menu_search(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(SearchSt.query)
+    await message.answer(t(lang_of(message.from_user.id), "search_prompt"))
+
+
+@user_router.message(SearchSt.query, F.text)
+async def search_query(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await do_search(message, message.text)
+
+
+# ───────────────────────────── Qismlarni yuborish ─────────────────────────────
+async def _send_episode(bot: Bot, chat_id: int, uid: int, lang: str, anime, number: int) -> str | None:
+    """Qismni yuboradi. Muvaffaqiyatli bo'lsa None, aks holda xato kaliti."""
+    ep = await repo.get_episode(anime.id, number)
+    if ep is None:
+        return "ep_missing"
+    eps = await repo.list_episode_numbers(anime.id)
+    idx = eps.index(number)
+    prev_n = eps[idx - 1] if idx > 0 else None
+    next_n = eps[idx + 1] if idx < len(eps) - 1 else None
+    caption = t(lang, "ep_caption", title=esc(anime.title), num=number, bot=f"@{bot_username()}")
+    nav = episode_nav_kb(anime.id, prev_n, next_n, lang)
+    try:
+        if ep.file_type == "document":
+            await bot.send_document(chat_id, ep.file_id, caption=caption, reply_markup=nav,
+                                    protect_content=True)
+        else:
+            await bot.send_video(chat_id, ep.file_id, caption=caption, reply_markup=nav,
+                                 protect_content=True, supports_streaming=True)
+    except TelegramAPIError as exc:
+        logger.warning("Qism yuborilmadi (%s/%s): %s", anime.id, number, exc)
+        return "ep_send_failed"
+    spawn(repo.add_episode_view(anime.id, number))
+    return None
+
+
+async def _episode_flow(cb: CallbackQuery, bot: Bot, strip_old_kb: bool) -> None:
+    _, aid, num = cb.data.split(":")
+    uid, lang = cb.from_user.id, lang_of(cb.from_user.id)
+    anime = await repo.get_anime(int(aid))
+    if anime is None:
+        await cb.answer(t(lang, "anime_missing"), show_alert=True)
+        return
+    if anime.is_vip and not await has_vip(uid):
+        await cb.answer(t(lang, "vip_only_alert"), show_alert=True)
+        await bot.send_message(cb.message.chat.id, t(lang, "vip_only_text"), reply_markup=vip_buy_kb(lang))
+        return
+    await cb.answer()
+    error = await _send_episode(bot, cb.message.chat.id, uid, lang, anime, int(num))
+    if error:
+        await bot.send_message(cb.message.chat.id, t(lang, error))
+    elif strip_old_kb:
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+
+
+@user_router.callback_query(F.data.startswith("ep:"))
+async def cb_episode(cb: CallbackQuery, bot: Bot) -> None:
+    await _episode_flow(cb, bot, strip_old_kb=False)
+
+
+@user_router.callback_query(F.data.startswith("epn:"))
+async def cb_episode_nav(cb: CallbackQuery, bot: Bot) -> None:
+    await _episode_flow(cb, bot, strip_old_kb=True)
+
+
+@user_router.callback_query(F.data.startswith("epp:"))
+async def cb_episode_page(cb: CallbackQuery) -> None:
+    _, aid, page = cb.data.split(":")
+    uid, lang = cb.from_user.id, lang_of(cb.from_user.id)
+    eps = await repo.list_episode_numbers(int(aid))
+    fav = await repo.is_favorite(uid, int(aid))
+    try:
+        await cb.message.edit_reply_markup(reply_markup=anime_kb(int(aid), eps, int(page), fav, lang))
+    except TelegramBadRequest:
+        pass
+    await cb.answer()
+
+
+# ───────────────────────────── Oddiy matn = qidiruv ─────────────────────────────
+@fallback_router.message(StateFilter(None), F.text, ~F.text.startswith("/"))
+async def free_text_search(message: Message) -> None:
+    await do_search(message, message.text)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HANDLER: /start, TIL, OBUNA
+# ════════════════════════════════════════════════════════════════════════════
+
+start_router = Router(name="start")
+
+
+async def proceed(bot: Bot, chat_id: int, user, lang: str, payload: str) -> None:
+    """Til tanlangandan keyin: obuna tekshiruvi → menyu → (bo'lsa) anime."""
+    uid = user.id
+    if not is_staff(uid):
+        missing = await missing_channels(bot, uid)
+        if missing:
+            await bot.send_message(chat_id, t(lang, "sub_required"),
+                                   reply_markup=sub_kb(missing, payload, lang))
+            return
+    await send_slot_sticker(bot, chat_id, "welcome")
+    await bot.send_message(
+        chat_id,
+        t(lang, "welcome", bot=esc(get_config().bot_name), name=esc(user.first_name or "do'st")),
+        reply_markup=main_menu(lang, is_staff(uid)),
+    )
+    match = re.fullmatch(r"a(\d{1,9})", payload or "")
+    if match:
+        await show_anime(bot, chat_id, uid, lang, int(match.group(1)))
+
+
+@start_router.message(CommandStart())
+async def cmd_start(message: Message, command: CommandObject, state: FSMContext, bot: Bot) -> None:
+    await state.clear()
+    user = message.from_user
+    await repo.upsert_user(user.id, user.full_name, user.username)
+    cache.known.add(user.id)
+    payload = command.args or ""
+    lang = cache.langs.get(user.id)
+    if not lang:
+        await message.answer(t("uz", "choose_lang"), reply_markup=lang_kb(payload))
+        return
+    await proceed(bot, message.chat.id, user, lang, payload)
+
+
+@start_router.message(Command("menu"))
+async def cmd_menu(message: Message, state: FSMContext, bot: Bot) -> None:
+    await state.clear()
+    await proceed(bot, message.chat.id, message.from_user, lang_of(message.from_user.id), "")
+
+
+@start_router.message(F.text.in_(variants("btn_lang")))
+async def menu_lang(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(t("uz", "choose_lang"), reply_markup=lang_kb(""))
+
+
+@start_router.callback_query(F.data.startswith("lang:"))
+async def cb_lang(cb: CallbackQuery, bot: Bot) -> None:
+    parts = cb.data.split(":")
+    code = parts[1] if len(parts) > 1 else ""
+    payload = parts[2] if len(parts) > 2 else ""
+    if code not in ("uz", "ru"):
+        await cb.answer()
+        return
+    await repo.set_lang(cb.from_user.id, code)
+    cache.langs[cb.from_user.id] = code
+    await cb.answer(t(code, "lang_set"))
+    try:
+        await cb.message.delete()
+    except Exception:  # noqa: BLE001
+        pass
+    await proceed(bot, cb.message.chat.id, cb.from_user, code, payload)
+
+
+@start_router.callback_query(F.data.startswith("chk:"))
+async def cb_check_sub(cb: CallbackQuery, bot: Bot) -> None:
+    uid = cb.from_user.id
+    lang = lang_of(uid)
+    payload = cb.data.split(":", 1)[1]
+    missing = await missing_channels(bot, uid)
+    if missing:
+        await cb.answer(t(lang, "sub_not_yet"), show_alert=True)
+        try:  # faqat qolgan kanallarni ko'rsatamiz
+            await cb.message.edit_reply_markup(reply_markup=sub_kb(missing, payload, lang))
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    await cb.answer("✅")
+    try:
+        await cb.message.delete()
+    except Exception:  # noqa: BLE001
+        pass
+    await send_slot_sticker(bot, cb.message.chat.id, "sub_ok")
+    await proceed(bot, cb.message.chat.id, cb.from_user, lang, payload)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HANDLER: VIP
+# ════════════════════════════════════════════════════════════════════════════
+
+vip_router = Router(name="vip")
+
+
+async def _vip_view(uid: int, lang: str):
+    user = await repo.get_user(uid)
+    until = as_utc(user.vip_until) if user else None
+    if until and until > utcnow():
+        status = t(lang, "vip_active", until=fmt_dt(until))
+    else:
+        status = t(lang, "vip_none")
+    plans = get_plans()
+    plan_lines = "\n".join(f"• {esc(p['title'])} — <b>{fmt_money(p['price'])}</b> so'm" for p in plans)
+    return t(lang, "vip_info", status=status, plans=plan_lines), vip_plans_kb(plans, lang)
+
+
+@vip_router.message(F.text.in_(variants("btn_vip")))
+async def menu_vip(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text, markup_ = await _vip_view(message.from_user.id, lang_of(message.from_user.id))
+    await message.answer(text, reply_markup=markup_)
+
+
+@vip_router.callback_query(F.data == "vip:open")
+async def cb_vip_open(cb: CallbackQuery) -> None:
+    text, markup_ = await _vip_view(cb.from_user.id, lang_of(cb.from_user.id))
+    await cb.message.answer(text, reply_markup=markup_)
+    await cb.answer()
+
+
+@vip_router.callback_query(F.data.startswith("vp:"))
+async def cb_plan(cb: CallbackQuery, state: FSMContext) -> None:
+    lang = lang_of(cb.from_user.id)
+    plans = get_plans()
+    idx = int(cb.data.split(":")[1])
+    card = setting("card_number")
+    if idx >= len(plans):
+        await cb.answer()
+        return
+    if not card:
+        await cb.answer(t(lang, "vip_no_card"), show_alert=True)
+        return
+    plan = plans[idx]
+    await state.set_state(VipPay.receipt)
+    await state.update_data(title=plan["title"], days=plan["days"], price=plan["price"])
+    await cb.message.answer(
+        t(lang, "vip_pay", plan=esc(plan["title"]), amount=fmt_money(plan["price"]),
+          card=esc(card), holder=esc(setting("card_holder") or "—")),
+        reply_markup=cancel_kb(lang),
+    )
+    await cb.answer()
+
+
+@vip_router.message(VipPay.receipt, F.photo | F.document)
+async def got_receipt(message: Message, state: FSMContext, bot: Bot) -> None:
+    lang = lang_of(message.from_user.id)
+    data = await state.get_data()
+    await state.clear()
+    pid = await repo.create_payment(message.from_user.id, data["title"], data["days"], data["price"])
+    user = message.from_user
+    caption = (
+        f"💳 <b>Yangi to'lov #{pid}</b>\n\n"
+        f"👤 <a href=\"tg://user?id={user.id}\">{esc(user.full_name)}</a>"
+        f"{' (@' + user.username + ')' if user.username else ''}\n"
+        f"🆔 <code>{user.id}</code>\n"
+        f"📦 Tarif: <b>{esc(data['title'])}</b> ({data['days']} kun)\n"
+        f"💰 Summa: <b>{fmt_money(data['price'])}</b> so'm"
+    )
+    owner_kb = markup([[B("✅ Tasdiqlash", f"payok:{pid}", style="success"),
+                        B("❌ Rad etish", f"payno:{pid}", style="danger")]])
+    owner = get_config().owner_id
+    if message.photo:
+        await bot.send_photo(owner, message.photo[-1].file_id, caption=caption, reply_markup=owner_kb)
+    else:
+        await bot.send_document(owner, message.document.file_id, caption=caption, reply_markup=owner_kb)
+    await message.answer(t(lang, "vip_receipt_sent"))
+
+
+def _not_menu_text(message: Message) -> bool:
+    return (message.text or "") not in MENU_TEXTS
+
+
+@vip_router.message(VipPay.receipt, _not_menu_text)
+async def receipt_wrong(message: Message) -> None:
+    await message.answer(t(lang_of(message.from_user.id), "vip_receipt_only"))
+
+
+async def _finish_payment(cb: CallbackQuery, bot: Bot, approve: bool) -> None:
+    pid = int(cb.data.split(":")[1])
+    pay = await repo.get_payment(pid)
+    if pay is None or not await repo.set_payment_status(pid, "approved" if approve else "rejected"):
+        await cb.answer("Bu to'lov allaqachon ko'rib chiqilgan.", show_alert=True)
+        return
+    lang = lang_of(pay.user_id)
+    try:
+        if approve:
+            until = await repo.add_vip(pay.user_id, pay.days)
+            await send_slot_sticker(bot, pay.user_id, "vip_ok")
+            await bot.send_message(pay.user_id, t(lang, "vip_approved", until=fmt_dt(until)))
+        else:
+            await bot.send_message(pay.user_id, t(lang, "vip_rejected"))
+    except Exception:  # noqa: BLE001
+        logger.info("Foydalanuvchiga VIP xabari yetmadi")
+    mark = "✅ TASDIQLANDI" if approve else "❌ RAD ETILDI"
+    try:
+        await cb.message.edit_caption(caption=f"{cb.message.caption or ''}\n\n<b>{mark}</b>", reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+    await cb.answer(mark)
+
+
+@vip_router.callback_query(F.data.startswith("payok:"), IsOwner())
+async def pay_ok(cb: CallbackQuery, bot: Bot) -> None:
+    await _finish_payment(cb, bot, True)
+
+
+@vip_router.callback_query(F.data.startswith("payno:"), IsOwner())
+async def pay_no(cb: CallbackQuery, bot: Bot) -> None:
+    await _finish_payment(cb, bot, False)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HANDLER: ADMIN PANEL
+# ════════════════════════════════════════════════════════════════════════════
+
+panel_router = Router(name="admin_panel")
+panel_router.message.filter(IsStaff())
+panel_router.callback_query.filter(IsStaff())
+
+
+def panel_text(uid: int) -> str:
+    role = "👑 Owner" if is_owner(uid) else "🛡 Admin"
+    return f"🛠 <b>Admin paneli</b>\n\n👤 Rolingiz: <b>{role}</b>\n\nKerakli bo'limni tanlang 👇"
+
+
+@panel_router.message(Command("admin"))
+@panel_router.message(F.text == PANEL_BTN)
+async def open_panel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(panel_text(message.from_user.id), reply_markup=panel_kb(is_owner(message.from_user.id)))
+
+
+@panel_router.callback_query(F.data == "adm:main")
+async def cb_panel(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await render(cb, panel_text(cb.from_user.id), panel_kb(is_owner(cb.from_user.id)))
+    await cb.answer()
+
+
+# ───────────────────────────── Janrlar ─────────────────────────────
+async def _admin_genres_view(uid: int):
+    genres = await repo.list_genres()
+    text = "🎭 <b>Janrlar</b>\n\n" + (
+        "\n".join(f"• {esc(g.name)}" for g in genres) if genres else "Hozircha janrlar yo'q."
+    )
+    rows = [[B("➕ Yangi janr", "adm:gnew", style="success")]]
+    if is_owner(uid):
+        for g in genres:
+            rows.append([B(f"🗑 {g.name}", f"gdel:{g.id}", style="danger")])
+    rows.append(back_panel())
+    return text, markup(rows)
+
+
+@panel_router.callback_query(F.data == "adm:genres")
+async def cb_admin_genres(cb: CallbackQuery) -> None:
+    text, kb = await _admin_genres_view(cb.from_user.id)
+    await render(cb, text, kb)
+    await cb.answer()
+
+
+@panel_router.callback_query(F.data == "adm:gnew")
+async def cb_genre_new(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(NewGenre.name)
+    await render(cb, "🎭 Yangi <b>janr nomini</b> yuboring (masalan: Fantaziya):", cancel_kb())
+    await cb.answer()
+
+
+@panel_router.message(NewGenre.name, F.text)
+async def genre_name(message: Message, state: FSMContext) -> None:
+    name = message.text.strip()
+    if not 2 <= len(name) <= 40:
+        await message.answer("⚠️ Janr nomi 2–40 belgi bo'lishi kerak. Qayta yuboring:")
+        return
+    await state.clear()
+    genre = await repo.add_genre(name)
+    await message.answer(f"✅ Janr qo'shildi: <b>{esc(genre.name)}</b>")
+    text, kb = await _admin_genres_view(message.from_user.id)
+    await message.answer(text, reply_markup=kb)
+
+
+@panel_router.callback_query(F.data.startswith("gdel:"))
+async def cb_genre_del(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer("Faqat Owner o'chira oladi", show_alert=True)
+        return
+    await repo.delete_genre(int(cb.data.split(":")[1]))
+    text, kb = await _admin_genres_view(cb.from_user.id)
+    await render(cb, text, kb)
+    await cb.answer("🗑 O'chirildi")
+
+
+# ───────────────────────────── Post sozlamalarim ─────────────────────────────
+async def _pset_view(uid: int):
+    auto = setting(f"autopost:{uid}") == "1"
+    chosen = {int(x) for x in setting(f"targets:{uid}").split(",") if x.strip().isdigit()}
+    channels = await repo.list_channels("post")
+    text = (
+        "📮 <b>Post sozlamalarim</b>\n\n"
+        f"🤖 Avtomatik post: <b>{'yoqilgan ✅' if auto else 'o‘chirilgan ❌'}</b>\n\n"
+        "Yoqilsa, siz qo'shgan animelar <b>pastda belgilangan</b> kanallarga avtomatik tushadi.\n"
+        "O'chiq bo'lsa, postni o'zingiz anime sahifasidagi «📮 Post qilish» orqali istagan kanalga yuborasiz."
+    )
+    if not channels:
+        text += "\n\n⚠️ Post kanallari yo'q. Ularni Owner qo'shadi."
+    rows = [[B("🤖 Avto-postni o'chirish" if auto else "🤖 Avto-postni yoqish", "pset:auto",
+               style="danger" if auto else "success")]]
+    for ch in channels:
+        rows.append([B(f"{'✅' if ch.id in chosen else '▫️'} {ch.title}", f"pset:ch:{ch.id}")])
+    rows.append(back_panel())
+    return text, markup(rows)
+
+
+@panel_router.callback_query(F.data == "adm:pset")
+async def cb_pset(cb: CallbackQuery) -> None:
+    text, kb = await _pset_view(cb.from_user.id)
+    await render(cb, text, kb)
+    await cb.answer()
+
+
+@panel_router.callback_query(F.data == "pset:auto")
+async def cb_pset_auto(cb: CallbackQuery) -> None:
+    uid = cb.from_user.id
+    await set_setting(f"autopost:{uid}", "0" if setting(f"autopost:{uid}") == "1" else "1")
+    text, kb = await _pset_view(uid)
+    await render(cb, text, kb)
+    await cb.answer()
+
+
+@panel_router.callback_query(F.data.startswith("pset:ch:"))
+async def cb_pset_channel(cb: CallbackQuery) -> None:
+    uid, cid = cb.from_user.id, int(cb.data.split(":")[2])
+    chosen = {int(x) for x in setting(f"targets:{uid}").split(",") if x.strip().isdigit()}
+    chosen.symmetric_difference_update({cid})
+    await set_setting(f"targets:{uid}", ",".join(str(x) for x in sorted(chosen)))
+    text, kb = await _pset_view(uid)
+    await render(cb, text, kb)
+    await cb.answer()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HANDLER: ADMIN ANIME BOSHQARUVI
+# ════════════════════════════════════════════════════════════════════════════
+
+anime_router = Router(name="admin_anime")
+anime_router.message.filter(IsStaff())
+anime_router.callback_query.filter(IsStaff())
+
+
+# ───────────────────────────── Yordamchilar ─────────────────────────────
+async def anime_admin_view(anime_id: int, uid: int):
+    anime = await repo.get_anime(anime_id)
+    if anime is None:
+        return "❌ Anime topilmadi.", markup([[B("⬅️ Ro'yxat", "adm:anime:0")]])
+    eps = await repo.list_episode_numbers(anime_id)
+    text = (
+        f"🎬 <b>{esc(anime.title)}</b>  <code>#{anime.id}</code>\n\n"
+        f"🎭 Janr: {esc(', '.join(g.name for g in anime.genres) or '—')}\n"
+        f"📅 Yil: {anime.year or '—'}\n"
+        f"💎 VIP: {'ha' if anime.is_vip else 'yo‘q'}\n"
+        f"📼 Qismlar: <b>{len(eps)}</b>\n"
+        f"👁 Ko'rishlar: {anime.views}\n\n"
+        f"📝 {esc(short(anime.description, 400))}"
+    )
+    return text, anime_admin_kb(anime_id, is_owner(uid))
+
+
+async def show_card(event: Message | CallbackQuery, anime_id: int) -> None:
+    text, kb = await anime_admin_view(anime_id, event.from_user.id)
+    if isinstance(event, CallbackQuery):
+        await render(event, text, kb)
+    else:
+        await event.answer(text, reply_markup=kb)
+
+
+async def _start_upload(event: Message | CallbackQuery, state: FSMContext, anime_id: int, is_new: bool) -> None:
+    base = await repo.last_episode_number(anime_id)
+    await state.set_state(AddEpisodes.upload)
+    await state.update_data(anime_id=anime_id, is_new=is_new, base=base)
+    text = (
+        f"📼 <b>Qism yuklash</b>  (hozir {base} ta qism bor)\n\n"
+        "Videolarni <b>birma-bir, tartib bilan</b> yuboring. Raqamlar avtomatik beriladi: "
+        f"<b>{base + 1}-qism</b>, {base + 2}-qism va hokazo.\n\n"
+        "Hammasini yuborib bo'lgach, «✅ Tugatish» tugmasini bosing 👇"
+    )
+    kb = markup([[B("✅ Tugatish", f"epdone:{anime_id}", style="success")]])
+    if isinstance(event, CallbackQuery):
+        await render(event, text, kb)
+    else:
+        await event.answer(text, reply_markup=kb)
+
+
+# ───────────────────────────── Yangi anime qo'shish ─────────────────────────────
+@anime_router.callback_query(F.data == "adm:addanime")
+async def add_start(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(AddAnime.title)
+    await render(cb, "🎬 <b>Yangi anime</b>\n\n1️⃣ Anime <b>nomini</b> yuboring:", cancel_kb())
+    await cb.answer()
+
+
+@anime_router.message(AddAnime.title, F.text)
+async def add_title(message: Message, state: FSMContext) -> None:
+    title = message.text.strip()
+    if not 1 <= len(title) <= 200:
+        await message.answer("⚠️ Nom 1–200 belgi bo'lishi kerak. Qayta yuboring:")
+        return
+    await state.update_data(title=title)
+    await state.set_state(AddAnime.description)
+    await message.answer("2️⃣ Endi anime <b>tavsifini</b> yuboring:", reply_markup=cancel_kb())
+
+
+@anime_router.message(AddAnime.description, F.text)
+async def add_description(message: Message, state: FSMContext) -> None:
+    await state.update_data(description=message.text.strip()[:3000])
+    await state.set_state(AddAnime.poster)
+    await message.answer("3️⃣ Anime <b>rasmini (poster)</b> yuboring 🖼", reply_markup=cancel_kb())
+
+
+@anime_router.message(AddAnime.poster, F.photo)
+async def add_poster(message: Message, state: FSMContext) -> None:
+    await state.update_data(poster=message.photo[-1].file_id, genres=[])
+    await state.set_state(AddAnime.genres)
+    await _genre_step(message, state)
+
+
+@anime_router.message(AddAnime.poster)
+async def add_poster_wrong(message: Message) -> None:
+    await message.answer("⚠️ Iltimos, <b>rasm</b> yuboring (fayl emas, oddiy rasm).")
+
+
+async def _genre_step(event: Message | CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    selected = set(data.get("genres", []))
+    genres = await repo.list_genres()
+    text = "4️⃣ <b>Janr(lar)ni</b> tanlang (bir nechta bo'lishi mumkin):"
+    kb = genre_toggle_kb(genres, selected, "ng", "ngdone", "ngnew")
+    if isinstance(event, CallbackQuery):
+        await render(event, text, kb)
+    else:
+        await event.answer(text, reply_markup=kb)
+
+
+@anime_router.callback_query(AddAnime.genres, F.data.startswith("ng:"))
+async def add_genre_toggle(cb: CallbackQuery, state: FSMContext) -> None:
+    gid = int(cb.data.split(":")[1])
+    selected = set((await state.get_data()).get("genres", []))
+    selected.symmetric_difference_update({gid})
+    await state.update_data(genres=sorted(selected))
+    await _genre_step(cb, state)
+    await cb.answer()
+
+
+@anime_router.callback_query(AddAnime.genres, F.data == "ngnew")
+async def add_genre_new(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AddAnime.new_genre)
+    await render(cb, "➕ Yangi <b>janr nomini</b> yuboring:", cancel_kb())
+    await cb.answer()
+
+
+@anime_router.message(AddAnime.new_genre, F.text)
+async def add_genre_created(message: Message, state: FSMContext) -> None:
+    name = message.text.strip()
+    if not 2 <= len(name) <= 40:
+        await message.answer("⚠️ Janr nomi 2–40 belgi bo'lishi kerak. Qayta yuboring:")
+        return
+    genre = await repo.add_genre(name)
+    selected = set((await state.get_data()).get("genres", []))
+    selected.add(genre.id)
+    await state.update_data(genres=sorted(selected))
+    await state.set_state(AddAnime.genres)
+    await _genre_step(message, state)
+
+
+@anime_router.callback_query(AddAnime.genres, F.data == "ngdone")
+async def add_genres_done(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AddAnime.year)
+    kb = markup([[B("⏭ O'tkazib yuborish", "nyear:skip", style="primary")],
+                 [B("❌ Bekor qilish", "cancel", style="danger")]])
+    await render(cb, "5️⃣ Anime <b>yilini</b> yuboring (masalan: 2023):", kb)
+    await cb.answer()
+
+
+async def _ask_vip(event: Message | CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AddAnime.vip)
+    text = "6️⃣ Bu anime <b>faqat VIP</b> foydalanuvchilar uchunmi? 💎"
+    kb = yes_no("nvip:1", "nvip:0")
+    if isinstance(event, CallbackQuery):
+        await render(event, text, kb)
+    else:
+        await event.answer(text, reply_markup=kb)
+
+
+@anime_router.callback_query(AddAnime.year, F.data == "nyear:skip")
+async def add_year_skip(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(year=None)
+    await _ask_vip(cb, state)
+    await cb.answer()
+
+
+@anime_router.message(AddAnime.year, F.text)
+async def add_year(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    if not text.isdigit() or not 1950 <= int(text) <= 2100:
+        await message.answer("⚠️ Yilni to'g'ri yozing (1950–2100), masalan: <code>2023</code>")
+        return
+    await state.update_data(year=int(text))
+    await _ask_vip(message, state)
+
+
+@anime_router.callback_query(AddAnime.vip, F.data.startswith("nvip:"))
+async def add_finish(cb: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    anime_id = await repo.create_anime(
+        title=data["title"], description=data.get("description", ""), poster=data.get("poster"),
+        year=data.get("year"), is_vip=cb.data.endswith(":1"), created_by=cb.from_user.id,
+        genre_ids=data.get("genres", []),
+    )
+    await state.clear()
+    await cb.message.answer(f"✅ Anime yaratildi! Kodi: <code>{anime_id}</code>")
+    await _start_upload(cb, state, anime_id, is_new=True)
+    await cb.answer()
+
+
+# ───────────────────────────── Qism yuklash ─────────────────────────────
+@anime_router.callback_query(F.data.startswith("aep:add:"))
+async def ep_add_start(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await _start_upload(cb, state, int(cb.data.split(":")[2]), is_new=False)
+    await cb.answer()
+
+
+@anime_router.message(AddEpisodes.upload, F.video | F.document)
+async def ep_received(message: Message, state: FSMContext) -> None:
+    if message.video:
+        file_id, ftype = message.video.file_id, "video"
+    elif (message.document.mime_type or "").startswith("video/"):
+        file_id, ftype = message.document.file_id, "document"
+    else:
+        await message.answer("⚠️ Faqat <b>video</b> yuboring.")
+        return
+    data = await state.get_data()
+    number = await repo.add_episode(data["anime_id"], file_id, ftype)
+    kb = markup([[B("✅ Tugatish", f"epdone:{data['anime_id']}", style="success")]])
+    await message.reply(f"✅ <b>{number}-qism</b> qo'shildi. Keyingisini yuboring yoki tugating.", reply_markup=kb)
+
+
+@anime_router.message(AddEpisodes.upload)
+async def ep_wrong(message: Message) -> None:
+    await message.answer("📼 Video yuboring yoki «✅ Tugatish» tugmasini bosing.")
+
+
+@anime_router.callback_query(F.data.startswith("epdone:"))
+async def ep_done(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    anime_id = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    await state.clear()
+    base = data.get("base", 0) if data.get("anime_id") == anime_id else 0
+    last = await repo.last_episode_number(anime_id)
+    added = max(0, last - base)
+    note = f"✅ Tayyor! <b>{added}</b> ta qism qo'shildi." if added else "ℹ️ Yangi qism qo'shilmadi."
+    anime = await repo.get_anime(anime_id)
+    report: list[str] = []
+    if anime and added:
+        extra = None
+        if not data.get("is_new"):
+            first = base + 1
+            extra = f"🆕 <b>Yangi qism: {first}-qism</b>" if added == 1 else f"🆕 <b>Yangi qismlar: {first}–{last}</b>"
+        report = await auto_post(bot, anime, cb.from_user.id, cb.from_user.full_name, extra)
+    if report:
+        note += "\n\n📮 <b>Avtomatik post:</b>\n" + "\n".join(report)
+    await cb.message.answer(note)
+    await show_card(cb, anime_id)
+    await cb.answer()
+
+
+# ───────────────────────────── Animelar ro'yxati va qidirish ─────────────────────────────
+@anime_router.callback_query(F.data.startswith("adm:anime:"))
+async def admin_list(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    total = await repo.count_anime()
+    pages = pages_count(total, PER_PAGE)
+    page = max(0, min(int(cb.data.split(":")[2]), pages - 1))
+    items = await repo.list_anime(page * PER_PAGE, PER_PAGE)
+    text = f"📚 <b>Animelar</b> — {total} ta" if total else "📚 Hozircha animelar yo'q."
+    await render(cb, text, admin_anime_list_kb(items, page, pages))
+    await cb.answer()
+
+
+@anime_router.callback_query(F.data == "adm:find")
+async def find_start(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdminFind.query)
+    await render(cb, "🔎 Anime <b>kodi</b> yoki <b>nomini</b> yuboring:", cancel_kb())
+    await cb.answer()
+
+
+@anime_router.message(AdminFind.query, F.text)
+async def find_query(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    results = await repo.search_anime(message.text, limit=10)
+    if not results:
+        await message.answer("😕 Hech narsa topilmadi.", reply_markup=markup([[B("⬅️ Ro'yxat", "adm:anime:0")]]))
+        return
+    rows = [[B(f"{'💎 ' if a.is_vip else ''}{short(a.title, 40)} · #{a.id}", f"aa:{a.id}")] for a in results]
+    rows.append([B("⬅️ Ro'yxat", "adm:anime:0")])
+    await message.answer("🔎 <b>Natijalar:</b>", reply_markup=markup(rows))
+
+
+@anime_router.callback_query(F.data.startswith("aa:"))
+async def cb_card(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await show_card(cb, int(cb.data.split(":")[1]))
+    await cb.answer()
+
+
+@anime_router.callback_query(F.data.startswith("anu:"))
+async def cb_user_view(cb: CallbackQuery, bot: Bot) -> None:
+    await cb.answer()
+    await show_anime(bot, cb.message.chat.id, cb.from_user.id, lang_of(cb.from_user.id),
+                     int(cb.data.split(":")[1]))
+
+
+# ───────────────────────────── Qismlarni boshqarish ─────────────────────────────
+@anime_router.callback_query(F.data.startswith("aep:list:"))
+async def ep_list(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    _, _, aid, page = cb.data.split(":")
+    eps = await repo.list_episode_numbers(int(aid))
+    if not eps:
+        text = "📼 Qismlar yo'q."
+    else:
+        text = f"📼 <b>Qismlar</b> — {len(eps)} ta\n\nBoshqarish uchun qism raqamini bosing:"
+    await render(cb, text, episodes_admin_kb(int(aid), eps, int(page)))
+    await cb.answer()
+
+
+@anime_router.callback_query(F.data.startswith("aep:one:"))
+async def ep_one(cb: CallbackQuery) -> None:
+    _, _, aid, num = cb.data.split(":")
+    await render(cb, f"📼 <b>{num}-qism</b>\n\nNima qilamiz?",
+                 episode_actions_kb(int(aid), int(num), is_owner(cb.from_user.id)))
+    await cb.answer()
+
+
+@anime_router.callback_query(F.data.startswith("aep:view:"))
+async def ep_view(cb: CallbackQuery, bot: Bot) -> None:
+    _, _, aid, num = cb.data.split(":")
+    ep = await repo.get_episode(int(aid), int(num))
+    if ep is None:
+        await cb.answer("Qism topilmadi", show_alert=True)
+        return
+    await cb.answer()
+    try:
+        if ep.file_type == "document":
+            await bot.send_document(cb.message.chat.id, ep.file_id, caption=f"📼 {num}-qism")
+        else:
+            await bot.send_video(cb.message.chat.id, ep.file_id, caption=f"📼 {num}-qism")
+    except TelegramAPIError as exc:
+        await cb.message.answer(f"⚠️ Yuborib bo'lmadi: {esc(str(exc))}")
+
+
+@anime_router.callback_query(F.data.startswith("aep:rep:"))
+async def ep_replace_start(cb: CallbackQuery, state: FSMContext) -> None:
+    _, _, aid, num = cb.data.split(":")
+    await state.set_state(ReplaceEp.file)
+    await state.update_data(anime_id=int(aid), number=int(num))
+    await render(cb, f"🔄 <b>{num}-qism</b> uchun yangi videoni yuboring:", cancel_kb())
+    await cb.answer()
+
+
+@anime_router.message(ReplaceEp.file, F.video | F.document)
+async def ep_replace_done(message: Message, state: FSMContext) -> None:
+    if message.video:
+        file_id, ftype = message.video.file_id, "video"
+    elif (message.document.mime_type or "").startswith("video/"):
+        file_id, ftype = message.document.file_id, "document"
+    else:
+        await message.answer("⚠️ Faqat <b>video</b> yuboring.")
+        return
+    data = await state.get_data()
+    await state.clear()
+    await repo.replace_episode(data["anime_id"], data["number"], file_id, ftype)
+    await message.answer(f"✅ {data['number']}-qism almashtirildi.")
+    await show_card(message, data["anime_id"])
+
+
+@anime_router.callback_query(F.data.startswith("aep:del:"))
+async def ep_delete_ask(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer("Qismni faqat Owner o'chira oladi", show_alert=True)
+        return
+    _, _, aid, num = cb.data.split(":")
+    await render(cb, f"🗑 <b>{num}-qism</b> o'chirilsinmi?", yes_no(f"aep:delok:{aid}:{num}", f"aep:one:{aid}:{num}"))
+    await cb.answer()
+
+
+@anime_router.callback_query(F.data.startswith("aep:delok:"))
+async def ep_delete(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer("Qismni faqat Owner o'chira oladi", show_alert=True)
+        return
+    _, _, aid, num = cb.data.split(":")
+    await repo.delete_episode(int(aid), int(num))
+    await cb.answer("🗑 O'chirildi")
+    eps = await repo.list_episode_numbers(int(aid))
+    await render(cb, f"📼 <b>Qismlar</b> — {len(eps)} ta", episodes_admin_kb(int(aid), eps, 0))
+
+
+# ───────────────────────────── Tahrirlash ─────────────────────────────
+@anime_router.callback_query(F.data.startswith("aed:"))
+async def edit_menu(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    aid = int(cb.data.split(":")[1])
+    anime = await repo.get_anime(aid)
+    if anime is None:
+        await cb.answer("Topilmadi", show_alert=True)
+        return
+    await render(cb, f"✏️ <b>{esc(anime.title)}</b> — nimani o'zgartiramiz?", edit_menu_kb(aid, anime.is_vip))
+    await cb.answer()
+
+
+_EDIT_PROMPTS = {
+    "title": "📝 Yangi <b>nomni</b> yuboring:",
+    "description": "📄 Yangi <b>tavsifni</b> yuboring:",
+    "poster": "🖼 Yangi <b>rasmni</b> yuboring:",
+    "year": "📅 Yangi <b>yilni</b> yuboring (yilni o'chirish uchun 0):",
+}
+
+
+@anime_router.callback_query(F.data.startswith("aef:"))
+async def edit_field(cb: CallbackQuery, state: FSMContext) -> None:
+    _, aid, field = cb.data.split(":")
+    if field not in _EDIT_PROMPTS:
+        await cb.answer()
+        return
+    await state.set_state(EditAnime.value)
+    await state.update_data(anime_id=int(aid), field=field)
+    await render(cb, _EDIT_PROMPTS[field], cancel_kb())
+    await cb.answer()
+
+
+@anime_router.message(EditAnime.value, F.text)
+async def edit_text(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    field, aid = data["field"], data["anime_id"]
+    value: str | int | None = message.text.strip()
+    if field == "poster":
+        await message.answer("⚠️ Iltimos, <b>rasm</b> yuboring.")
+        return
+    if field == "title" and not 1 <= len(value) <= 200:
+        await message.answer("⚠️ Nom 1–200 belgi bo'lishi kerak.")
+        return
+    if field == "description":
+        value = value[:3000]
+    if field == "year":
+        if not value.isdigit() or not (int(value) == 0 or 1950 <= int(value) <= 2100):
+            await message.answer("⚠️ Yilni to'g'ri yozing (1950–2100) yoki 0.")
+            return
+        value = int(value) or None
+    await repo.update_anime(aid, **{field: value})
+    await state.clear()
+    await message.answer("✅ Saqlandi.")
+    await show_card(message, aid)
+
+
+@anime_router.message(EditAnime.value, F.photo)
+async def edit_photo(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    if data["field"] != "poster":
+        await message.answer("⚠️ Bu yerda matn yuboring.")
+        return
+    await repo.update_anime(data["anime_id"], poster=message.photo[-1].file_id)
+    await state.clear()
+    await message.answer("✅ Rasm yangilandi.")
+    await show_card(message, data["anime_id"])
+
+
+@anime_router.callback_query(F.data.startswith("aeg:"))
+async def edit_genres(cb: CallbackQuery) -> None:
+    aid = int(cb.data.split(":")[1])
+    selected = await repo.anime_genre_ids(aid)
+    genres = await repo.list_genres()
+    await render(cb, "🎭 Janrlarni belgilang (yangi janr: Panel → 🎭 Janrlar):",
+                 genre_toggle_kb(genres, selected, f"aegt:{aid}", f"aed:{aid}", None))
+    await cb.answer()
+
+
+@anime_router.callback_query(F.data.startswith("aegt:"))
+async def edit_genre_toggle(cb: CallbackQuery) -> None:
+    _, aid, gid = cb.data.split(":")
+    selected = await repo.anime_genre_ids(int(aid))
+    selected.symmetric_difference_update({int(gid)})
+    await repo.set_anime_genres(int(aid), list(selected))
+    genres = await repo.list_genres()
+    await render(cb, "🎭 Janrlarni belgilang (yangi janr: Panel → 🎭 Janrlar):",
+                 genre_toggle_kb(genres, selected, f"aegt:{aid}", f"aed:{aid}", None))
+    await cb.answer()
+
+
+@anime_router.callback_query(F.data.startswith("aevip:"))
+async def edit_vip(cb: CallbackQuery) -> None:
+    aid = int(cb.data.split(":")[1])
+    anime = await repo.get_anime(aid)
+    if anime is None:
+        await cb.answer("Topilmadi", show_alert=True)
+        return
+    await repo.update_anime(aid, is_vip=not anime.is_vip)
+    await render(cb, f"✏️ <b>{esc(anime.title)}</b> — nimani o'zgartiramiz?", edit_menu_kb(aid, not anime.is_vip))
+    await cb.answer("💎 VIP holati o'zgartirildi")
+
+
+# ───────────────────────────── Animeni o'chirish (Owner) ─────────────────────────────
+@anime_router.callback_query(F.data.startswith("adel:"))
+async def anime_delete_ask(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer("Animeni faqat Owner o'chira oladi", show_alert=True)
+        return
+    aid = int(cb.data.split(":")[1])
+    anime = await repo.get_anime(aid)
+    if anime is None:
+        await cb.answer("Topilmadi", show_alert=True)
+        return
+    await render(cb, f"🗑 <b>{esc(anime.title)}</b> va uning <b>barcha qismlari</b> butunlay o'chiriladi.\n\nRostdan ham?",
+                 yes_no(f"adelok:{aid}", f"aa:{aid}"))
+    await cb.answer()
+
+
+@anime_router.callback_query(F.data.startswith("adelok:"))
+async def anime_delete(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer("Animeni faqat Owner o'chira oladi", show_alert=True)
+        return
+    await repo.delete_anime(int(cb.data.split(":")[1]))
+    await render(cb, "🗑 Anime butunlay o'chirildi.", markup([[B("⬅️ Ro'yxat", "adm:anime:0")]]))
+    await cb.answer()
+
+
+# ───────────────────────────── Post qilish ─────────────────────────────
+@anime_router.callback_query(F.data.startswith("apost:"))
+async def post_choose_channel(cb: CallbackQuery) -> None:
+    aid = int(cb.data.split(":")[1])
+    channels = await repo.list_channels("post")
+    if not channels:
+        await render(cb, "⚠️ Post kanallari yo'q. Ularni Owner qo'shadi (Panel → 📡 Post kanallari).",
+                     markup([[B("⬅️ Orqaga", f"aa:{aid}")]]))
+        await cb.answer()
+        return
+    rows = [[B(f"📡 {short(c.title, 40)}", f"apch:{aid}:{c.id}")] for c in channels]
+    rows.append([B("⬅️ Orqaga", f"aa:{aid}")])
+    await render(cb, "📮 Qaysi kanal/guruhga post qilamiz?", markup(rows))
+    await cb.answer()
+
+
+@anime_router.callback_query(F.data.startswith("apch:"))
+async def post_choose_when(cb: CallbackQuery) -> None:
+    _, aid, chid = cb.data.split(":")
+    kb = markup([
+        [B("🚀 Hozir yuborish", f"apnow:{aid}:{chid}", style="success"),
+         B("🕒 Rejalashtirish", f"apsch:{aid}:{chid}", style="primary")],
+        [B("⬅️ Orqaga", f"apost:{aid}")],
+    ])
+    await render(cb, "⏱ Postni qachon yuboramiz?", kb)
+    await cb.answer()
+
+
+@anime_router.callback_query(F.data.startswith("apnow:"))
+async def post_now(cb: CallbackQuery, bot: Bot) -> None:
+    _, aid, chid = cb.data.split(":")
+    anime, channel = await repo.get_anime(int(aid)), await repo.get_channel(int(chid))
+    if anime is None or channel is None:
+        await cb.answer("Anime yoki kanal topilmadi", show_alert=True)
+        return
+    err = await send_post(bot, anime, channel.chat_id, cb.from_user.full_name)
+    text = f"✅ Post <b>{esc(channel.title)}</b> kanaliga yuborildi!" if err is None else \
+        f"❌ Yuborib bo'lmadi: {esc(short(err, 200))}\n\nBot kanalda admin ekanini tekshiring."
+    await render(cb, text, markup([[B("⬅️ Anime", f"aa:{aid}")]]))
+    await cb.answer()
+
+
+@anime_router.callback_query(F.data.startswith("apsch:"))
+async def post_schedule_start(cb: CallbackQuery, state: FSMContext) -> None:
+    _, aid, chid = cb.data.split(":")
+    await state.set_state(PostSchedule.when)
+    await state.update_data(anime_id=int(aid), channel_id=int(chid))
+    await render(
+        cb,
+        "🕒 Yuborish <b>sana va vaqtini</b> yozing (Toshkent vaqti):\n\n"
+        "<code>2026-11-05 20:30</code>\nyoki\n<code>05.11.2026 20:30</code>",
+        cancel_kb(),
+    )
+    await cb.answer()
+
+
+@anime_router.message(PostSchedule.when, F.text)
+async def post_schedule_done(message: Message, state: FSMContext) -> None:
+    run_at = parse_local_datetime(message.text)
+    if run_at is None:
+        await message.answer("⚠️ Format noto'g'ri. Masalan: <code>2026-11-05 20:30</code>")
+        return
+    if run_at <= utcnow():
+        await message.answer("⚠️ Bu vaqt o'tib ketgan. Kelajakdagi vaqtni yozing.")
+        return
+    data = await state.get_data()
+    channel = await repo.get_channel(data["channel_id"])
+    await state.clear()
+    if channel is None:
+        await message.answer("❌ Kanal topilmadi.")
+        return
+    await repo.add_scheduled(data["anime_id"], channel.chat_id, channel.title, run_at, message.from_user.id)
+    await message.answer(
+        f"✅ Post rejalashtirildi!\n\n📡 {esc(channel.title)}\n🕒 {fmt_dt(run_at)}",
+        reply_markup=markup([[B("⬅️ Anime", f"aa:{data['anime_id']}")]]),
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HANDLER: OWNER KANALLAR/ADMINLAR/SHABLON/STIKER
+# ════════════════════════════════════════════════════════════════════════════
+
+channels_router = Router(name="owner_channels")
+channels_router.message.filter(IsOwner())
+channels_router.callback_query.filter(IsOwner())
+
+KIND_TITLES = {"sub": "📢 Majburiy obuna kanallari", "post": "📡 Post kanallari / guruhlari"}
+
+
+# ───────────────────────────── Kanallar ─────────────────────────────
+async def _channels_view(kind: str):
+    channels = await repo.list_channels(kind)
+    lines = "\n".join(
+        f"• {esc(c.title)}" + (f" (@{c.username})" if c.username else "") + f"  <code>{c.chat_id}</code>"
+        for c in channels
+    ) or "Hozircha yo'q."
+    hint = (
+        "Foydalanuvchilar shu kanallarga obuna bo'lmaguncha botdan foydalana olmaydi."
+        if kind == "sub" else "Animelar shu kanal/guruhlarga post qilinadi."
+    )
+    return f"<b>{KIND_TITLES[kind]}</b>\n\n{lines}\n\n<i>{hint}</i>", channels_kb(kind, channels)
+
+
+@channels_router.callback_query(F.data.startswith("adm:ch:"))
+async def cb_channels(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text, kb = await _channels_view(cb.data.split(":")[2])
+    await render(cb, text, kb)
+    await cb.answer()
+
+
+@channels_router.callback_query(F.data.startswith("chadd:"))
+async def cb_channel_add(cb: CallbackQuery, state: FSMContext) -> None:
+    kind = cb.data.split(":")[1]
+    await state.set_state(AddChannel.ref)
+    await state.update_data(kind=kind)
+    await render(
+        cb,
+        "➕ <b>Kanal/guruh qo'shish</b>\n\n"
+        "Quyidagilardan birini yuboring:\n"
+        "• <code>@kanal_username</code>\n"
+        "• yoki ID: <code>-1001234567890</code>\n"
+        "• yoki o'sha kanaldan biror postni shu yerga <b>forward</b> qiling\n\n"
+        "⚠️ Bot o'sha kanal/guruhda <b>ADMIN</b> bo'lishi shart!",
+        cancel_kb(),
+    )
+    await cb.answer()
+
+
+def _extract_ref(message: Message) -> int | str | None:
+    origin = message.forward_origin
+    if origin is not None and getattr(origin, "type", "") == "channel":
+        return origin.chat.id
+    text = (message.text or "").strip()
+    if re.fullmatch(r"-100\d{5,}", text):
+        return int(text)
+    match = re.fullmatch(r"(?:https?://)?t\.me/([A-Za-z0-9_]{4,})/?|@?([A-Za-z0-9_]{4,})", text)
+    if match:
+        return "@" + (match.group(1) or match.group(2))
+    return None
+
+
+@channels_router.message(AddChannel.ref)
+async def channel_ref(message: Message, state: FSMContext, bot: Bot) -> None:
+    ref = _extract_ref(message)
+    if ref is None:
+        await message.answer("⚠️ Tushunmadim. <code>@username</code>, <code>-100...</code> ID yuboring "
+                             "yoki kanaldan post forward qiling.")
+        return
+    kind = (await state.get_data())["kind"]
+    try:
+        chat = await bot.get_chat(ref)
+        me = await bot.get_chat_member(chat.id, bot.id)
+    except TelegramAPIError as exc:
+        await message.answer(f"❌ Kanal topilmadi yoki bot u yerda yo'q.\n<i>{esc(short(str(exc), 120))}</i>\n\n"
+                             "Botni kanalga <b>admin</b> qilib qo'shib, qayta urinib ko'ring.")
+        return
+    if me.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+        await message.answer("❌ Bot bu kanalda <b>admin emas</b>. Avval botni admin qiling, so'ng qayta yuboring.")
+        return
+
+    invite = None
+    if kind == "sub":
+        if chat.username:
+            invite = f"https://t.me/{chat.username}"
+        else:
+            try:
+                invite = (await bot.create_chat_invite_link(chat.id)).invite_link
+            except TelegramAPIError:
+                await message.answer("❌ Yopiq kanal uchun taklif havolasini yaratib bo'lmadi. "
+                                     "Botga «Foydalanuvchilarni taklif qilish» huquqini bering.")
+                return
+    added = await repo.add_channel(kind, chat.id, chat.title or chat.username or str(chat.id),
+                                   chat.username, invite)
+    await state.clear()
+    if added is None:
+        await message.answer("ℹ️ Bu kanal allaqachon qo'shilgan.")
+    else:
+        if kind == "sub":
+            await refresh_channels()
+        await message.answer(f"✅ <b>{esc(added.title)}</b> qo'shildi!")
+    text, kb = await _channels_view(kind)
+    await message.answer(text, reply_markup=kb)
+
+
+@channels_router.callback_query(F.data.startswith("chdel:"))
+async def cb_channel_del(cb: CallbackQuery) -> None:
+    _, kind, cid = cb.data.split(":")
+    await repo.remove_channel(int(cid))
+    if kind == "sub":
+        await refresh_channels()
+    text, kb = await _channels_view(kind)
+    await render(cb, text, kb)
+    await cb.answer("🗑 O'chirildi")
+
+
+# ───────────────────────────── Adminlar ─────────────────────────────
+async def _admins_view():
+    env_ids = get_config().admin_ids
+    ids = await repo.list_admin_ids()
+    lines = "\n".join(f"• <code>{i}</code>" + (" (.env)" if i in env_ids else "") for i in ids) or "Hozircha yo'q."
+    rows = [[B(f"🗑 {i}", f"admdel:{i}", style="danger")] for i in ids if i not in env_ids]
+    rows.append([B("➕ Admin qo'shish", "admadd", style="success")])
+    rows.append(back_panel())
+    return ("👮 <b>Adminlar</b>\n\n" + lines + "\n\n<i>Admin: anime va qism qo'shadi/tahrirlaydi, post qiladi. "
+            "O'chirish va sozlamalar — faqat Owner.</i>"), markup(rows)
+
+
+@channels_router.callback_query(F.data == "adm:admins")
+async def cb_admins(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text, kb = await _admins_view()
+    await render(cb, text, kb)
+    await cb.answer()
+
+
+@channels_router.callback_query(F.data == "admadd")
+async def cb_admin_add(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AddAdmin.uid)
+    await render(cb, "👮 Yangi adminning <b>Telegram ID</b> raqamini yuboring\n"
+                     "(yoki uning biror xabarini forward qiling):", cancel_kb())
+    await cb.answer()
+
+
+@channels_router.message(AddAdmin.uid)
+async def admin_added(message: Message, state: FSMContext, bot: Bot) -> None:
+    uid = None
+    origin = message.forward_origin
+    if origin is not None and getattr(origin, "type", "") == "user":
+        uid = origin.sender_user.id
+    elif (message.text or "").strip().isdigit():
+        uid = int(message.text.strip())
+    if uid is None:
+        await message.answer("⚠️ ID raqam yuboring yoki foydalanuvchi xabarini forward qiling.")
+        return
+    await state.clear()
+    if await repo.add_admin(uid):
+        cache.admins.add(uid)
+        await message.answer(f"✅ <code>{uid}</code> admin qilindi.")
+        try:
+            await bot.send_message(uid, "🎉 Siz <b>admin</b> etib tayinlandingiz! Panel: /admin")
+        except TelegramAPIError:
+            await message.answer("ℹ️ U botga hali /start bosmagan, shuning uchun xabar yetmadi.")
+    else:
+        await message.answer("ℹ️ Bu foydalanuvchi allaqachon admin.")
+    text, kb = await _admins_view()
+    await message.answer(text, reply_markup=kb)
+
+
+@channels_router.callback_query(F.data.startswith("admdel:"))
+async def cb_admin_del(cb: CallbackQuery) -> None:
+    uid = int(cb.data.split(":")[1])
+    await repo.remove_admin(uid)
+    cache.admins.discard(uid)
+    text, kb = await _admins_view()
+    await render(cb, text, kb)
+    await cb.answer("🗑 Admin olib tashlandi")
+
+
+# ───────────────────────────── Post shabloni ─────────────────────────────
+async def _tpl_view():
+    template = setting("post_template") or DEFAULT_TEMPLATE
+    ig = setting("instagram_url")
+    show = setting("post_show_poster") == "1"
+    text = (
+        "🧩 <b>Post shabloni</b>\n\n"
+        f"<code>{esc(template)}</code>\n\n"
+        f"Mavjud maydonlar: <code>{esc(PLACEHOLDERS)}</code>\n"
+        "HTML: <code>&lt;b&gt;qalin&lt;/b&gt;</code>, <code>&lt;i&gt;kursiv&lt;/i&gt;</code>\n\n"
+        f"📸 Instagram: <b>{esc(ig) if ig else 'ulanmagan'}</b>\n"
+        f"👤 «Post qilgan odam» ko'rsatilsinmi: <b>{'ha' if show else 'yo‘q'}</b>"
+    )
+    rows = [
+        [B("✏️ Shablonni o'zgartirish", "tplset", style="primary"), B("👁 Namuna", "tplprev")],
+        [B("📸 Instagram havola", "tpligram")],
+    ]
+    if ig:
+        rows.append([B("🗑 Instagramni olib tashlash", "tplig_clear", style="danger")])
+    rows.append([B("👤 Post qilgan odam: " + ("ha ✅" if show else "yo'q ❌"), "tplshow")])
+    rows.append([B("🔄 Standart shablon", "tplreset"), *back_panel()])
+    return text, markup(rows)
+
+
+@channels_router.callback_query(F.data == "adm:tpl")
+async def cb_tpl(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text, kb = await _tpl_view()
+    await render(cb, text, kb)
+    await cb.answer()
+
+
+@channels_router.callback_query(F.data == "tplset")
+async def cb_tpl_set(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(SetTemplate.text)
+    await render(cb, "✏️ Yangi shablon matnini yuboring.\n\n"
+                     f"Maydonlar: <code>{esc(PLACEHOLDERS)}</code>", cancel_kb())
+    await cb.answer()
+
+
+@channels_router.message(SetTemplate.text, F.text)
+async def tpl_saved(message: Message, state: FSMContext, bot: Bot) -> None:
+    # Owner <b>...</b> deb yozsa — oddiy matn; Telegram'da qalin qilib belgilasa — entity (html_text)
+    template = (message.html_text if message.entities else message.text).strip()
+    try:  # 1) {maydon} sintaksisi, 2) HTML to'g'riligini preview yuborib tekshiramiz
+        caption = render_caption(sample_anime(), None, None, template)
+        await bot.send_message(message.chat.id, "👁 <b>Namuna:</b>\n\n" + caption)
+    except (ValueError, KeyError, IndexError, TelegramAPIError) as exc:
+        await message.answer(f"❌ Shablonda xato: <i>{esc(short(str(exc), 150))}</i>\nQayta yuboring:")
+        return
+    await state.clear()
+    await set_setting("post_template", template)
+    await message.answer("✅ Shablon saqlandi!")
+    text, kb = await _tpl_view()
+    await message.answer(text, reply_markup=kb)
+
+
+@channels_router.callback_query(F.data == "tplprev")
+async def cb_tpl_preview(cb: CallbackQuery, bot: Bot) -> None:
+    anime = sample_anime()
+    await bot.send_message(cb.message.chat.id, render_caption(anime, cb.from_user.full_name),
+                           reply_markup=post_kb(anime.id))
+    await cb.answer()
+
+
+@channels_router.callback_query(F.data == "tplreset")
+async def cb_tpl_reset(cb: CallbackQuery) -> None:
+    await del_setting("post_template")
+    text, kb = await _tpl_view()
+    await render(cb, text, kb)
+    await cb.answer("🔄 Standart shablon")
+
+
+@channels_router.callback_query(F.data == "tplshow")
+async def cb_tpl_show(cb: CallbackQuery) -> None:
+    await set_setting("post_show_poster", "0" if setting("post_show_poster") == "1" else "1")
+    text, kb = await _tpl_view()
+    await render(cb, text, kb)
+    await cb.answer()
+
+
+@channels_router.callback_query(F.data == "tpligram")
+async def cb_instagram(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(SetInstagram.url)
+    await render(cb, "📸 Instagram havolasini yuboring (masalan: <code>https://instagram.com/kagedub</code>):",
+                 cancel_kb())
+    await cb.answer()
+
+
+@channels_router.message(SetInstagram.url, F.text)
+async def instagram_saved(message: Message, state: FSMContext) -> None:
+    url = message.text.strip()
+    if not re.fullmatch(r"https://(www\.)?instagram\.com/\S+", url):
+        await message.answer("⚠️ Havola <code>https://instagram.com/...</code> ko'rinishida bo'lishi kerak.")
+        return
+    await state.clear()
+    await set_setting("instagram_url", url)
+    await message.answer("✅ Instagram havolasi saqlandi.")
+    text, kb = await _tpl_view()
+    await message.answer(text, reply_markup=kb)
+
+
+@channels_router.callback_query(F.data == "tplig_clear")
+async def cb_instagram_clear(cb: CallbackQuery) -> None:
+    await del_setting("instagram_url")
+    text, kb = await _tpl_view()
+    await render(cb, text, kb)
+    await cb.answer("🗑 Olib tashlandi")
+
+
+# ───────────────────────────── Stikerlar ─────────────────────────────
+STICKER_SLOTS = {
+    "welcome": "👋 /start da",
+    "sub_ok": "✅ Obuna tasdiqlanganda",
+    "vip_ok": "💎 VIP tasdiqlanganda",
+    "ban": "🚫 Ban xabarida",
+}
+
+
+async def _stickers_view():
+    rows = [[B(f"{'✅' if setting('sticker_' + slot) else '▫️'} {title}", f"stk:{slot}")]
+            for slot, title in STICKER_SLOTS.items()]
+    rows.append(back_panel())
+    return ("🎟 <b>Stikerlar</b>\n\nQaysi paytda stiker yuborilishini tanlang, so'ng stikerni yuboring.\n"
+            "✅ — o'rnatilgan, ▫️ — o'rnatilmagan (stiker yuborilmaydi)."), markup(rows)
+
+
+@channels_router.callback_query(F.data == "adm:stk")
+async def cb_stickers(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text, kb = await _stickers_view()
+    await render(cb, text, kb)
+    await cb.answer()
+
+
+@channels_router.callback_query(F.data.startswith("stk:"))
+async def cb_sticker_slot(cb: CallbackQuery, state: FSMContext) -> None:
+    slot = cb.data.split(":")[1]
+    if slot not in STICKER_SLOTS:
+        await cb.answer()
+        return
+    await state.set_state(SetSticker.sticker)
+    await state.update_data(slot=slot)
+    await render(cb, f"🎟 <b>{STICKER_SLOTS[slot]}</b> uchun stikerni yuboring.\nTozalash uchun <code>0</code> yozing.",
+                 cancel_kb())
+    await cb.answer()
+
+
+@channels_router.message(SetSticker.sticker, F.sticker)
+async def sticker_saved(message: Message, state: FSMContext) -> None:
+    slot = (await state.get_data())["slot"]
+    await state.clear()
+    await set_setting(f"sticker_{slot}", message.sticker.file_id)
+    await message.answer("✅ Stiker saqlandi!")
+    text, kb = await _stickers_view()
+    await message.answer(text, reply_markup=kb)
+
+
+@channels_router.message(SetSticker.sticker, F.text == "0")
+async def sticker_cleared(message: Message, state: FSMContext) -> None:
+    slot = (await state.get_data())["slot"]
+    await state.clear()
+    await del_setting(f"sticker_{slot}")
+    await message.answer("🗑 Stiker tozalandi.")
+    text, kb = await _stickers_view()
+    await message.answer(text, reply_markup=kb)
+
+
+@channels_router.message(SetSticker.sticker)
+async def sticker_wrong(message: Message) -> None:
+    await message.answer("⚠️ Stiker yuboring (yoki tozalash uchun 0).")
+
+
+# ───────────────────────────── Rejalashtirilgan postlar ─────────────────────────────
+async def _sched_view():
+    items = await repo.list_scheduled()
+    if not items:
+        return "🕒 Rejalashtirilgan postlar yo'q.", markup([back_panel()])
+    rows, lines = [], []
+    for it in items:
+        anime = await repo.get_anime(it.anime_id)
+        name = anime.title if anime else f"#{it.anime_id}"
+        lines.append(f"• {fmt_dt(it.run_at)} — <b>{esc(short(name, 30))}</b> → {esc(it.channel_title)}")
+        rows.append([B(f"🗑 {fmt_dt(it.run_at)} · {short(name, 20)}", f"schdel:{it.id}", style="danger")])
+    rows.append(back_panel())
+    return "🕒 <b>Rejalashtirilgan postlar</b>\n\n" + "\n".join(lines), markup(rows)
+
+
+@channels_router.callback_query(F.data == "adm:sched")
+async def cb_sched(cb: CallbackQuery) -> None:
+    text, kb = await _sched_view()
+    await render(cb, text, kb)
+    await cb.answer()
+
+
+@channels_router.callback_query(F.data.startswith("schdel:"))
+async def cb_sched_del(cb: CallbackQuery) -> None:
+    await repo.cancel_scheduled(int(cb.data.split(":")[1]))
+    text, kb = await _sched_view()
+    await render(cb, text, kb)
+    await cb.answer("🗑 Bekor qilindi")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HANDLER: OWNER STATISTIKA/BAN/BROADCAST/VIP
+# ════════════════════════════════════════════════════════════════════════════
+
+owners_router = Router(name="owner_users")
+owners_router.message.filter(IsOwner())
+owners_router.callback_query.filter(IsOwner())
+
+_tasks: set[asyncio.Task] = set()  # fon vazifalarini xotirada ushlab turish uchun
+
+
+# ───────────────────────────── Statistika ─────────────────────────────
+@owners_router.callback_query(F.data == "adm:stats")
+async def cb_stats(cb: CallbackQuery) -> None:
+    s = await repo.stats(day_start_utc())
+    top = await repo.top_anime(5)
+    top_lines = "\n".join(f"{i}. {esc(short(a.title, 30))} — 👁 {a.views}" for i, a in enumerate(top, 1)) or "—"
+    text = (
+        "📊 <b>Statistika</b>\n\n"
+        f"👥 Foydalanuvchilar: <b>{s['users']}</b>\n"
+        f"🆕 Bugun: <b>{s['today']}</b>  |  7 kun: <b>{s['week']}</b>\n"
+        f"💎 VIP: <b>{s['vip']}</b>\n"
+        f"🚫 Ban: <b>{s['banned']}</b>  |  Botni bloklagan: <b>{s['blocked']}</b>\n\n"
+        f"🎬 Animelar: <b>{s['anime']}</b>\n"
+        f"📼 Qismlar: <b>{s['episodes']}</b>\n"
+        f"👁 Qism ko'rishlar: <b>{s['views']}</b>\n\n"
+        f"🏆 <b>Eng ko'p ko'rilgan:</b>\n{top_lines}"
+    )
+    await render(cb, text, markup([[B("🔄 Yangilash", "adm:stats")], back_panel()]))
+    await cb.answer()
+
+
+# ───────────────────────────── Ban / Unban ─────────────────────────────
+def _ban_menu():
+    return "🚫 <b>Ban boshqaruvi</b>", markup([
+        [B("🚫 Ban berish", "banadd", style="danger"), B("✅ Banni olish", "banrem", style="success")],
+        [B("📋 Banlanganlar", "banlist")],
+        back_panel(),
+    ])
+
+
+@owners_router.callback_query(F.data == "adm:ban")
+async def cb_ban(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text, kb = _ban_menu()
+    await render(cb, text, kb)
+    await cb.answer()
+
+
+@owners_router.callback_query(F.data == "banadd")
+async def cb_ban_add(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(BanSt.ban)
+    await render(
+        cb,
+        "🚫 <b>ID</b> va <b>muddatni</b> yuboring:\n\n"
+        "<code>123456789 2 kun</code>\n<code>123456789 4 soat</code>\n"
+        "<code>123456789 1 kun 6 soat</code>\n<code>123456789 30 daqiqa</code>\n"
+        "<code>123456789 abadiy</code>\n\n"
+        "Birliklar: daqiqa, soat, kun, hafta, oy",
+        cancel_kb(),
+    )
+    await cb.answer()
+
+
+@owners_router.message(BanSt.ban, F.text)
+async def ban_done(message: Message, state: FSMContext, bot: Bot) -> None:
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) != 2 or not parts[0].isdigit():
+        await message.answer("⚠️ Format: <code>ID muddat</code>, masalan <code>123456789 2 kun</code>")
+        return
+    uid, delta = int(parts[0]), parse_duration(parts[1])
+    if delta is None:
+        await message.answer("⚠️ Muddat tushunarsiz. Masalan: <code>2 kun</code>, <code>4 soat</code>, "
+                             "<code>30 daqiqa</code>")
+        return
+    if is_staff(uid):
+        await message.answer("⚠️ Owner yoki adminni ban qilib bo'lmaydi.")
+        return
+    await state.clear()
+    until = utcnow() + delta
+    await repo.ban_user(uid, until)
+    cache.bans[uid] = until
+    cache.known.add(uid)
+    await message.answer(f"🚫 <code>{uid}</code> ban qilindi.\n⏳ Muddat: <b>{fmt_duration(delta)}</b>\n"
+                         f"🕒 Tugash: {fmt_dt(until)}")
+    try:
+        await send_slot_sticker(bot, uid, "ban")
+        await bot.send_message(uid, BAN_TEXT.format(left=fmt_duration(delta), until=fmt_dt(until)))
+    except TelegramAPIError:
+        pass
+    text, kb = _ban_menu()
+    await message.answer(text, reply_markup=kb)
+
+
+@owners_router.callback_query(F.data == "banrem")
+async def cb_unban(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(BanSt.unban)
+    await render(cb, "✅ Banni olib tashlash uchun foydalanuvchi <b>ID</b> sini yuboring:", cancel_kb())
+    await cb.answer()
+
+
+@owners_router.message(BanSt.unban, F.text)
+async def unban_done(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = message.text.strip()
+    if not text.isdigit():
+        await message.answer("⚠️ Faqat ID raqam yuboring.")
+        return
+    uid = int(text)
+    await state.clear()
+    cache.bans.pop(uid, None)
+    cache.ban_notified.pop(uid, None)
+    if await repo.unban_user(uid):
+        await message.answer(f"✅ <code>{uid}</code> bani olib tashlandi.")
+        try:
+            await bot.send_message(uid, UNBAN_TEXT)
+        except TelegramAPIError:
+            pass
+    else:
+        await message.answer("ℹ️ Bu foydalanuvchi banda emas.")
+    menu_text, kb = _ban_menu()
+    await message.answer(menu_text, reply_markup=kb)
+
+
+@owners_router.callback_query(F.data == "banlist")
+async def cb_ban_list(cb: CallbackQuery) -> None:
+    bans = await repo.active_bans()
+    if not bans:
+        text = "📋 Hozir banlangan foydalanuvchilar yo'q."
+    else:
+        now = utcnow()
+        lines = [f"• <code>{uid}</code> — {fmt_duration(until - now)} qoldi"
+                 for uid, until in sorted(bans.items(), key=lambda x: x[1])[:40]]
+        text = f"📋 <b>Banlanganlar</b> — {len(bans)} ta\n\n" + "\n".join(lines)
+    await render(cb, text, markup([[B("⬅️ Orqaga", "adm:ban")]]))
+    await cb.answer()
+
+
+# ───────────────────────────── Xabar yuborish (broadcast) ─────────────────────────────
+@owners_router.callback_query(F.data == "adm:bc")
+async def cb_broadcast(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(BroadcastSt.message)
+    await render(cb, "📣 Hammaga yuboriladigan xabarni yuboring.\n\n"
+                     "Matn, rasm, video, tugmali xabar — hammasi mumkin. Avval ko'rib chiqasiz.", cancel_kb())
+    await cb.answer()
+
+
+@owners_router.message(BroadcastSt.message)
+async def broadcast_preview(message: Message, state: FSMContext, bot: Bot) -> None:
+    await state.update_data(chat_id=message.chat.id, message_id=message.message_id)
+    total = len(await repo.broadcast_ids())
+    await bot.copy_message(message.chat.id, message.chat.id, message.message_id)
+    await message.answer(
+        f"👆 Xabar shunday ko'rinadi.\n👥 Qabul qiluvchilar: <b>{total}</b> ta\n\nYuboraymi?",
+        reply_markup=markup([[B("🚀 Yuborish", "bcgo", style="success"),
+                              B("❌ Bekor qilish", "cancel", style="danger")]]),
+    )
+
+
+@owners_router.callback_query(F.data == "bcgo")
+async def broadcast_go(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    await state.clear()
+    if "message_id" not in data:
+        await cb.answer("Xabar topilmadi, qayta boshlang", show_alert=True)
+        return
+    status = await render(cb, "📣 Yuborish boshlandi... Tugagach hisobot keladi.")
+    task = asyncio.create_task(
+        run_broadcast(bot, cb.message.chat.id, data["chat_id"], data["message_id"], status or cb.message)
+    )
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+    await cb.answer("🚀")
+
+
+# ───────────────────────────── VIP boshqaruvi ─────────────────────────────
+async def _vip_menu():
+    plans = "\n".join(f"• {esc(p['title'])} — {p['days']} kun — <b>{fmt_money(p['price'])}</b> so'm"
+                      for p in get_plans())
+    card, holder = setting("card_number"), setting("card_holder")
+    text = (
+        "💎 <b>VIP boshqaruvi</b>\n\n"
+        f"💳 Karta: <b>{esc(card) if card else 'kiritilmagan ⚠️'}</b>\n"
+        f"👤 Karta egasi: <b>{esc(holder) if holder else '—'}</b>\n\n"
+        f"💰 <b>Tariflar:</b>\n{plans}"
+    )
+    return text, markup([
+        [B("💳 Kartani o'zgartirish", "vipcard", style="primary"), B("💰 Narxlar", "vipplans", style="primary")],
+        [B("🎁 VIP berish", "vipgive", style="success"), B("➖ VIP olish", "viprem", style="danger")],
+        back_panel(),
+    ])
+
+
+@owners_router.callback_query(F.data == "adm:vip")
+async def cb_vip(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text, kb = await _vip_menu()
+    await render(cb, text, kb)
+    await cb.answer()
+
+
+@owners_router.callback_query(F.data == "vipcard")
+async def cb_vip_card(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(SetCard.number)
+    await render(cb, "💳 To'lov <b>karta raqamini</b> yuboring (foydalanuvchilarga shu ko'rsatiladi):", cancel_kb())
+    await cb.answer()
+
+
+@owners_router.message(SetCard.number, F.text)
+async def card_number(message: Message, state: FSMContext) -> None:
+    number = message.text.strip()
+    digits = number.replace(" ", "")
+    if not digits.isdigit() or not 12 <= len(digits) <= 19:
+        await message.answer("⚠️ Karta raqami 12–19 ta raqamdan iborat bo'lishi kerak.")
+        return
+    await state.update_data(number=" ".join(digits[i:i + 4] for i in range(0, len(digits), 4)))
+    await state.set_state(SetCard.holder)
+    await message.answer("👤 Karta <b>egasining ism-familiyasini</b> yuboring:", reply_markup=cancel_kb())
+
+
+@owners_router.message(SetCard.holder, F.text)
+async def card_holder(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+    await set_setting("card_number", data["number"])
+    await set_setting("card_holder", message.text.strip()[:60])
+    await message.answer("✅ Karta saqlandi.")
+    text, kb = await _vip_menu()
+    await message.answer(text, reply_markup=kb)
+
+
+@owners_router.callback_query(F.data == "vipplans")
+async def cb_plans(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(SetPlans.text)
+    await render(
+        cb,
+        "💰 Tariflarni har qatorda bittadan yuboring:\n<code>nomi|kun|narx</code>\n\nMasalan:\n"
+        "<code>1 oy|30|15000\n3 oy|90|40000\n12 oy|365|140000</code>",
+        cancel_kb(),
+    )
+    await cb.answer()
+
+
+@owners_router.message(SetPlans.text, F.text)
+async def plans_saved(message: Message, state: FSMContext) -> None:
+    plans = parse_plans(message.text)
+    if plans is None:
+        await message.answer("⚠️ Format noto'g'ri. Har qator: <code>nomi|kun|narx</code>")
+        return
+    await state.clear()
+    await set_setting("vip_plans", json.dumps(plans, ensure_ascii=False))
+    await message.answer("✅ Tariflar saqlandi.")
+    text, kb = await _vip_menu()
+    await message.answer(text, reply_markup=kb)
+
+
+@owners_router.callback_query(F.data == "vipgive")
+async def cb_vip_give(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(GiveVip.data)
+    await render(cb, "🎁 <b>ID</b> va <b>kun</b> sonini yuboring:\n<code>123456789 30</code>", cancel_kb())
+    await cb.answer()
+
+
+@owners_router.message(GiveVip.data, F.text)
+async def vip_given(message: Message, state: FSMContext, bot: Bot) -> None:
+    parts = message.text.split()
+    if len(parts) != 2 or not all(p.isdigit() for p in parts) or int(parts[1]) <= 0:
+        await message.answer("⚠️ Format: <code>ID kun</code>, masalan <code>123456789 30</code>")
+        return
+    uid, days = int(parts[0]), int(parts[1])
+    await state.clear()
+    until = await repo.add_vip(uid, days)
+    await message.answer(f"✅ <code>{uid}</code> ga {days} kunlik VIP berildi (→ {fmt_dt(until)}).")
+    try:
+        await send_slot_sticker(bot, uid, "vip_ok")
+        await bot.send_message(uid, t(lang_of(uid), "vip_approved", until=fmt_dt(until)))
+    except TelegramAPIError:
+        pass
+
+
+@owners_router.callback_query(F.data == "viprem")
+async def cb_vip_remove(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(RemoveVip.uid)
+    await render(cb, "➖ VIP olib tashlanadigan foydalanuvchi <b>ID</b> sini yuboring:", cancel_kb())
+    await cb.answer()
+
+
+@owners_router.message(RemoveVip.uid, F.text)
+async def vip_removed(message: Message, state: FSMContext) -> None:
+    if not message.text.strip().isdigit():
+        await message.answer("⚠️ Faqat ID raqam yuboring.")
+        return
+    await state.clear()
+    ok = await repo.remove_vip(int(message.text.strip()))
+    await message.answer("✅ VIP olib tashlandi." if ok else "ℹ️ Bu foydalanuvchida VIP yo'q.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ROUTERLAR TARTIBI (MUHIM: o'zgartirmang)
+# ════════════════════════════════════════════════════════════════════════════
+
+def get_routers() -> list[Router]:
+    return [
+        errors_router,
+        common_router,
+        start_router,
+        vip_router,
+        user_router,
+        panel_router,
+        anime_router,
+        channels_router,
+        owners_router,
+        fallback_router,  # doim eng oxirida (oddiy matn = qidiruv)
+    ]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ISHGA TUSHIRISH: BAZA VA KESH
+# ════════════════════════════════════════════════════════════════════════════
+
+async def init_database(cfg: Config) -> None:
+    init_engine(cfg.database_url)
+    await create_tables()
+
+
+async def load_cache(bot: Bot, cfg: Config) -> None:
+    # Env dagi adminlarni bazaga yozamiz
+    for uid in cfg.admin_ids:
+        await repo.add_admin(uid)
+    cache.admins = set(await repo.list_admin_ids())
+    cache.settings = await repo.load_settings()
+
+    users = await repo.load_users_light()
+    cache.known = {uid for uid, _ in users}
+    cache.langs = {uid: lang for uid, lang in users if lang}
+    cache.bans = await repo.active_bans()
+
+    me = await bot.get_me()
+    cache.bot_username = me.username or cfg.bot_username
+    logger.info("Bot: @%s | foydalanuvchilar: %s | adminlar: %s",
+                cache.bot_username, len(cache.known), len(cache.admins))
+
+    await _seed_default_channel(bot, cfg)
+    await refresh_channels()
+
+
+async def _seed_default_channel(bot: Bot, cfg: Config) -> None:
+    """DEFAULT_SUB_CHANNEL (masalan @kagedub1) ni birinchi marta majburiy obunaga qo'shadi."""
+    if not cfg.default_sub_channel or setting("default_channel_seeded") == "1":
+        return
+    ref: int | str = cfg.default_sub_channel
+    if str(ref).lstrip("-").isdigit():
+        ref = int(ref)
+    try:
+        chat = await bot.get_chat(ref)
+        link = f"https://t.me/{chat.username}" if chat.username else (
+            await bot.create_chat_invite_link(chat.id)).invite_link
+    except TelegramAPIError as exc:
+        logger.warning("Boshlang'ich kanal qo'shilmadi (%s). Botni kanalga admin qiling: %s", ref, exc)
+        return
+    await repo.add_channel("sub", chat.id, chat.title or str(ref), chat.username, link)
+    await set_setting("default_channel_seeded", "1")
+    logger.info("Boshlang'ich majburiy kanal qo'shildi: %s", chat.title)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ISHGA TUSHIRISH: WEBHOOK / POLLING
+# ════════════════════════════════════════════════════════════════════════════
+
+WEBHOOK_PATH = "/webhook"
+ALLOWED_UPDATES = ["message", "callback_query"]
+
+
+def build_dispatcher() -> Dispatcher:
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_routers(*get_routers())
+    dp.message.outer_middleware(AccessMiddleware())
+    dp.callback_query.outer_middleware(AccessMiddleware())
+    return dp
+
+
+async def health(_: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
+def make_hooks(cfg: Config):
+    scheduler: dict[str, asyncio.Task] = {}
+
+    async def on_startup(bot: Bot) -> None:
+        await init_database(cfg)
+        await load_cache(bot, cfg)
+        if cfg.base_url:
+            await bot.set_webhook(
+                url=f"{cfg.base_url}{WEBHOOK_PATH}",
+                secret_token=cfg.webhook_secret,
+                allowed_updates=ALLOWED_UPDATES,
+                max_connections=100,
+            )
+            logger.info("Webhook o'rnatildi: %s%s", cfg.base_url, WEBHOOK_PATH)
+        scheduler["task"] = asyncio.create_task(scheduler_loop(bot))
+
+    async def on_shutdown(bot: Bot) -> None:
+        task = scheduler.get("task")
+        if task:
+            task.cancel()
+        await close_engine()
+        await bot.session.close()
+
+    return on_startup, on_shutdown
+
+
+def build_app(bot: Bot, dp: Dispatcher, cfg: Config) -> web.Application:
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=cfg.webhook_secret).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+    return app
+
+
+def run_webhook(bot: Bot, dp: Dispatcher, cfg: Config) -> None:
+    web.run_app(build_app(bot, dp, cfg), host="0.0.0.0", port=cfg.port)
+
+
+async def run_polling(bot: Bot, dp: Dispatcher, cfg: Config) -> None:
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", cfg.port).start()
+    await bot.delete_webhook(drop_pending_updates=False)
+    try:
+        await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES)
+    finally:
+        await runner.cleanup()
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    cfg = get_config()
+    bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = build_dispatcher()
+    on_startup, on_shutdown = make_hooks(cfg)
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    if cfg.base_url:
+        run_webhook(bot, dp, cfg)
+    else:
+        asyncio.run(run_polling(bot, dp, cfg))
+
+
+if __name__ == "__main__":
+    main()
